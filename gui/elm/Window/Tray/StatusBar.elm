@@ -99,9 +99,7 @@ viewMessage helpers status =
     of
         Syncing n ->
             [ text (statusToString helpers status)
-            , text " ("
-            , text (helpers.pluralize n "Dashboard left SINGULAR" "Dashboard left PLURAL")
-            , text ")"
+            , text (countToString helpers n)
             ]
 
         Error message ->
@@ -112,6 +110,17 @@ viewMessage helpers status =
 
         _ ->
             [ text (statusToString helpers status) ]
+
+
+countToString : Helpers -> Int -> String
+countToString helpers n =
+    if n > 1 then
+        " ("
+            ++ helpers.pluralize n "Dashboard left SINGULAR" "Dashboard left PLURAL"
+            ++ ")"
+
+    else
+        ""
 
 
 view : Helpers -> Status -> Platform -> Html msg
