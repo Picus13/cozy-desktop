@@ -86,7 +86,7 @@ statusToString helpers status =
             helpers.t "Dashboard Prepare"
 
         Syncing _ ->
-            helpers.t "Dashboard Syncing"
+            helpers.t "Dashboard Synchronize"
 
         Error _ ->
             helpers.t "Dashboard Error:"
@@ -97,6 +97,13 @@ viewMessage helpers status =
     case
         status
     of
+        Syncing n ->
+            [ text (statusToString helpers status)
+            , text " ("
+            , text (helpers.pluralize n "Dashboard left SINGULAR" "Dashboard left PLURAL")
+            , text ")"
+            ]
+
         Error message ->
             [ text (statusToString helpers status)
             , text " "
