@@ -29,10 +29,17 @@ module.exports = class SyncState extends EventEmitter {
       ? 'buffering'
       : 'uptodate'
 
-    super.emit('sync-status', {
-      label: label,
-      remaining: Math.max(1, this.syncLastSeq - this.syncCurrentSeq)
-    })
+    const remaining = Math.max(1, this.syncLastSeq - this.syncCurrentSeq)
+    if (isNaN(remaining) && label === 'sync') {
+      const err = new Error('syncstate: remaining is not a number')
+      // eslint-disable-next-line no-console
+      console.log(Object.assign({ err, label, remaining }, this))
+    } else {
+      super.emit('sync-status', {
+        label: label,
+        remaining
+      })
+    }
 
     if (this.wasSpinning && !this.shouldSpin()) {
       this.emit('up-to-date')
@@ -63,8 +70,8 @@ module.exports = class SyncState extends EventEmitter {
         this.emitStatus()
         break
       case 'sync-start':
-        this.syncSyncing = true
-        this.emitStatus()
+        // this.syncSyncing = true
+        // this.emitStatus()
         break
       case 'local-end':
         this.localSyncing = false
@@ -83,6 +90,7 @@ module.exports = class SyncState extends EventEmitter {
         this.emitStatus()
         break
       case 'sync-current':
+        this.syncSyncing = true
         this.syncCurrentSeq = args[0]
         this.emitStatus()
         break
