@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/pouch.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/pouch.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * @module core/pouch
+ * @flow weak
+ */
+
+const autoBind = require('auto-bind')
+const Promise = require('bluebird')
+const PouchDB = require('pouchdb')
+const async = require('async')
+const fse = require('fs-extra')
+const _ = require('lodash')
+const { isEqual } = _
+const path = require('path')
+
+const metadata = require('./metadata')
+const logger = require('./utils/logger')
+
+/*::
+import type { Config } from './config'
+import type { Metadata } from './metadata'
+import type { Callback } from './utils/func'
+*/
+
+const log = logger({
+  component: 'Pouch'
+})
+
+// Pouchdb is used to store all the metadata about files and folders.
+// These metadata can come from the local filesystem or the remote cozy instance.
+//
+// Best practices from:
+// http://pouchdb.com/2014/06/17/12-pro-tips-for-better-code-with-pouchdb.html
+// http://docs.ehealthafrica.org/couchdb-best-practices/
+//
+// For naming conventions, we kept those used on cozy and its couchdb. And
+// views name are in camelcase (byChecksum, not by-checksum).
+class Pouch {
+  /*::
+  config: Config
+  db: PouchDB
+  updater: any
+  _lock: {id: number, promise: Promise}
+  nextLockId: number
+  */
+
+  constructor(config) {
+    this.config = config
+    this.nextLockId = 0
+    this._lock = { id: this.nextLockId++, promise: Promise.resolve(null) }
+    this.db = new PouchDB(this.config.dbPath)
+    this.db.setMaxListeners(100)
+    this.db.on('error', err => log.warn(err))
+    this.updater = async.queue((task, callback) => {
+      return this.db.get(task._id, (err, doc) => {
+        if (err &amp;&amp; err.status === 404) {
+          return this.db.put(task, callback)
+        } else if (err) {
+          return callback(err)
+        } else {
+          task._rev = doc._rev
+          return this.db.put(task, callback)
+        }
+      })
+    })
+
+    autoBind(this)
+    Promise.promisifyAll(this)
+  }
+
+  /*::
+  byPathAsync: (string) => Promise&lt;Metadata>
+  byChecksumAsync: (string) => Promise&lt;Metadata[]>
+  byRecursivePathAsync: (string) => Promise&lt;*>
+  byRemoteIdAsync: (id: string) => Promise&lt;*>
+  byRemoteIdMaybeAsync: (id: string) => Promise&lt;*>
+  addAllViewsAsync: () => Promise&lt;*>
+  getPreviousRevAsync: (id: string, shortRev: ?number) => Promise&lt;Metadata>
+  getLocalSeqAsync: () => Promise&lt;number>
+  setLocalSeqAsync: (number) => Promise&lt;*>
+  getRemoteSeqAsync: () => string
+  setRemoteSeqAsync: (seq: string) => Promise&lt;*>
+  treeAsync: () => Promise&lt;Array&lt;string>>
+  */
+
+  // Create database and recreate all filters
+  resetDatabase(callback) {
+    this.db.destroy(() => {
+      fse.ensureDirSync(this.config.dbPath)
+      this.db = new PouchDB(this.config.dbPath)
+      this.db.setMaxListeners(100)
+      this.db.on('error', err => log.warn(err))
+      return this.addAllViews(callback)
+    })
+  }
+
+  lock(component /*: * */) /*: Promise&lt;Function> */ {
+    const id = this.nextLockId++
+    if (typeof component !== 'string') component = component.constructor.name
+    log.trace({ component, lock: { id, state: 'requested' } })
+    let pCurrent = this._lock.promise
+    let _resolve
+    let pReleased = new Promise(resolve => {
+      _resolve = resolve
+    })
+    this._lock = { id, promise: pCurrent.then(() => pReleased) }
+    return pCurrent.then(() => {
+      log.trace({ component, lock: { id, state: 'acquired' } })
+      return () => {
+        log.trace({ component, lock: { id, state: 'released' } })
+        _resolve()
+      }
+    })
+  }
+
+  /* Mini ODM */
+
+  put(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    metadata.invariants(doc)
+    const { local, remote } = doc.sides
+    log.debug(
+      { path: doc.path, local, remote, _deleted: doc._deleted, doc },
+      'Saving metadata...'
+    )
+    return this.db.put(doc)
+  }
+
+  remove(doc /*: Metadata */) /*: Promise&lt;*> */ {
+    return this.put(_.defaults({ _deleted: true }, doc))
+  }
+
+  // WARNING: bulkDocs is not a transaction, some updates can be applied while
+  // others do not.
+  // Make sure lock is acquired before using it to avoid conflict.
+  async bulkDocs(docs /*: Metadata[] */) {
+    for (const doc of docs) {
+      metadata.invariants(doc)
+      const { path } = doc
+      const { local, remote } = doc.sides || {}
+      log.debug(
+        { path, local, remote, _deleted: doc._deleted, doc },
+        'Saving bulk metadata...'
+      )
+    }
+    const results = await this.db.bulkDocs(docs)
+    for (let [idx, result] of results.entries()) {
+      if (result.error) {
+        const err = new Error(result.message)
+        // $FlowFixMe
+        err.status = result.status
+        err.name = result.name
+        log.error({ doc: docs[idx] }, err)
+        throw err
+      }
+    }
+    return results
+  }
+
+  // Run a query and get all the results
+  getAll(query, params, callback) {
+    if (typeof params === 'function') {
+      callback = params
+      params = { include_docs: true }
+    }
+    // XXX Pouchdb does sometimes send us undefined values in docs.
+    // It's rare and we didn't find a way to extract a proper test case.
+    // So, we keep a workaround and hope that this bug will be fixed.
+    this.db.query(query, params, function(err, res) {
+      if (err) {
+        return callback(err)
+      } else {
+        let docs = Array.from(res.rows)
+          .filter(row => row.doc != null)
+          .map(row => row.doc)
+        return callback(null, docs)
+      }
+    })
+  }
+
+  // Get current revision for multiple docs by ids as an index id => rev
+  // non-existing documents will not be added to the index
+  async getAllRevsAsync(ids) {
+    const result = await this.db.allDocs({ keys: ids })
+    const index = {}
+    for (let row of result.rows) if (row.value) index[row.key] = row.value.rev
+    return index
+  }
+
+  async byIdMaybeAsync(id /*: string */) /*: Promise&lt;?Metadata> */ {
+    let doc
+    try {
+      doc = await this.db.get(id)
+    } catch (err) {
+      if (err.status !== 404) throw err
+    }
+    return doc
+  }
+
+  // Return all the files with this checksum
+  byChecksum(checksum, callback) {
+    let params = {
+      key: checksum,
+      include_docs: true
+    }
+    return this.getAll('byChecksum', params, callback)
+  }
+
+  // Return all the files and folders in this path, only at first level
+  byPath(path, callback) {
+    let params = {
+      key: path,
+      include_docs: true
+    }
+    return this.getAll('byPath', params, callback)
+  }
+
+  // Return all the files and folders in this path, even in subfolders
+  byRecursivePath(basePath, callback) {
+    let params
+    if (basePath === '') {
+      params = { include_docs: true }
+    } else {
+      params = {
+        startkey: `${basePath}`,
+        endkey: `${basePath}${path.sep}\ufff0`,
+        include_docs: true
+      }
+    }
+    return this.getAll('byPath', params, callback)
+  }
+
+  // Return the file/folder with this remote id
+  byRemoteId(id, callback) {
+    let params = {
+      key: id,
+      include_docs: true
+    }
+    this.db.query('byRemoteId', params, function(err, res) {
+      if (err) {
+        return callback(err)
+      } else if (res.rows.length === 0) {
+        // eslint-disable-next-line standard/no-callback-literal
+        return callback({ status: 404, message: 'missing' })
+      } else {
+        return callback(null, res.rows[0].doc)
+      }
+    })
+  }
+
+  byRemoteIdMaybe(id, callback) {
+    this.byRemoteId(id, (err, was) => {
+      if (err &amp;&amp; err.status !== 404) {
+        callback(err)
+      } else {
+        callback(null, was)
+      }
+    })
+  }
+
+  async allByRemoteIds(remoteIds /*: * */) /* Promise&lt;Metadata[]> */ {
+    const params = { keys: Array.from(remoteIds), include_docs: true }
+    const results = await this.db.query('byRemoteId', params)
+    return results.rows.map(row => row.doc)
+  }
+
+  /* Views */
+
+  // Create all required views in the database
+  addAllViews(callback) {
+    return async.series(
+      [this.addByPathView, this.addByChecksumView, this.addByRemoteIdView],
+      err => callback(err)
+    )
+  }
+
+  // Create a view to list files and folders inside a path
+  // The path for a file/folder in root will be '',
+  // not '.' as with node's path.dirname
+  addByPathView(callback) {
+    const sep = JSON.stringify(path.sep)
+    let query = `
+      function (doc) {
+        if ('docType' in doc) {
+          let parts = doc._id.split(${sep})
+          parts.pop()
+          return emit(parts.join(${sep}), {_id: doc._id})
+        }
+      }
+    `
+    return this.createDesignDoc('byPath', query, callback)
+  }
+
+  // Create a view to find files by their checksum
+  addByChecksumView(callback) {
+    /* !pragma no-coverage-next */
+    /* istanbul ignore next */
+    let query = function(doc) {
+      if ('md5sum' in doc) {
+        // $FlowFixMe
+        return emit(doc.md5sum) // eslint-disable-line no-undef
+      }
+    }.toString()
+    return this.createDesignDoc('byChecksum', query, callback)
+  }
+
+  // Create a view to find file/folder by their _id on a remote cozy
+  addByRemoteIdView(callback) {
+    /* !pragma no-coverage-next */
+    /* istanbul ignore next */
+    let query = function(doc) {
+      if ('remote' in doc) {
+        // $FlowFixMe
+        return emit(doc.remote._id) // eslint-disable-line no-undef
+      }
+    }.toString()
+    return this.createDesignDoc('byRemoteId', query, callback)
+  }
+
+  // Create or update given design doc
+  createDesignDoc(name, query, callback) {
+    let doc = {
+      _id: `_design/${name}`,
+      views: {}
+    }
+    doc.views[name] = { map: query }
+    this.db.get(doc._id, (_, designDoc) => {
+      if (designDoc != null) {
+        // $FlowFixMe
+        doc._rev = designDoc._rev
+        if (isEqual(doc, designDoc)) {
+          return callback()
+        }
+      }
+      return this.db.put(doc, function(err) {
+        if (!err) {
+          log.debug(`Design document created: ${name}`)
+        }
+        return callback(err)
+      })
+    })
+  }
+
+  // Remove a design document for a given docType
+  removeDesignDoc(docType, callback) {
+    let id = `_design/${docType}`
+    this.db.get(id, (err, designDoc) => {
+      if (designDoc != null) {
+        return this.db.remove(id, designDoc._rev, callback)
+      } else {
+        return callback(err)
+      }
+    })
+  }
+
+  /* Helpers */
+
+  // Retrieve a previous doc revision from its id
+  getPreviousRev(id, shortRev, callback) {
+    let options = {
+      revs: true,
+      revs_info: true,
+      open_revs: 'all'
+    }
+    this.db.get(id, options, (err, infos) => {
+      if (err) {
+        return callback(err)
+      } else {
+        let { ids } = infos[0].ok._revisions
+        let { start } = infos[0].ok._revisions
+        let revId = ids[start - shortRev]
+        let rev = `${shortRev}-${revId}`
+        return this.db.get(id, { rev }, function(err, doc) {
+          if (err) {
+            log.debug(infos[0].doc)
+          }
+          return callback(err, doc)
+        })
+      }
+    })
+  }
+
+  /* Sequence numbers */
+
+  // Get last local replication sequence,
+  // ie the last change from pouchdb that have been applied
+  getLocalSeq(callback) {
+    this.db.get('_local/localSeq', function(err, doc) {
+      if (err &amp;&amp; err.status === 404) {
+        callback(null, 0)
+      } else {
+        callback(err, doc &amp;&amp; doc.seq)
+      }
+    })
+  }
+
+  // Set last local replication sequence
+  // It is saved in PouchDB as a local document
+  // See http://pouchdb.com/guides/local-documents.html
+  setLocalSeq(seq, callback) {
+    let task = {
+      _id: '_local/localSeq',
+      seq
+    }
+    return this.updater.push(task, callback)
+  }
+
+  // Get last remote replication sequence,
+  // ie the last change from couchdb that have been saved in pouch
+  getRemoteSeq(callback) {
+    this.db.get('_local/remoteSeq', function(err, doc) {
+      if (err &amp;&amp; err.status === 404) {
+        callback(null, 0)
+      } else {
+        callback(err, doc &amp;&amp; doc.seq)
+      }
+    })
+  }
+
+  // Set last remote replication sequence
+  // It is saved in PouchDB as a local document
+  // See http://pouchdb.com/guides/local-documents.html
+  setRemoteSeq(seq, callback) {
+    let task = {
+      _id: '_local/remoteSeq',
+      seq
+    }
+    return this.updater.push(task, callback)
+  }
+
+  tree(callback) {
+    this.db.allDocs((err, result) => {
+      if (err) return callback(err)
+      callback(null, result.rows.map(row => row.id).sort())
+    })
+  }
+}
+
+module.exports = Pouch
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js__help.window_.html">gui/js/"help.window"</a></li><li><a href="module-gui_js__onboarding.window_.html">gui/js/"onboarding.window"</a></li><li><a href="module-gui_js__tray.window_.html">gui/js/"tray.window"</a></li><li><a href="module-gui_js__updated.window_.html">gui/js/"updated.window"</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_">_</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#fixIdenticalRenamed">fixIdenticalRenamed</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#ignoreDeletedBeforeIdenticalRenamed">ignoreDeletedBeforeIdenticalRenamed</a></li><li><a href="global.html#indexDeletedEvent">indexDeletedEvent</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#Promise">Promise</a></li><li><a href="global.html#rotateState">rotateState</a></li><li><a href="global.html#step">step</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

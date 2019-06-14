@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Class: Local</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Class: Local</h1>
+
+    
+
+
+
+
+<section>
+
+<header>
+    
+        <h2><span class="attribs"><span class="type-signature"></span></span>
+            <span class="ancestors"><a href="module-core_local.html">core/local</a>~</span>Local<span class="signature">()</span><span class="type-signature"></span></h2>
+        
+            <div class="class-description"><p>Local is the class that interfaces cozy-desktop with the local filesystem.
+It uses a watcher, based on chokidar, to listen for file and folder changes.
+It also applied changes from the remote cozy on the local filesystem.</p></div>
+        
+    
+</header>
+
+<article>
+    <div class="container-overview">
+    
+        
+
+    
+    <h2>Constructor</h2>
+    
+
+    
+    <h4 class="name" id="Local"><span class="type-signature"></span>new Local<span class="signature">()</span><span class="type-signature"></span></h4>
+    
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<dl class="details">
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+    <dt class="tag-source">Source:</dt>
+    <dd class="tag-source"><ul class="dummy"><li>
+        <a href="core_local_index.js.html">core/local/index.js</a>, <a href="core_local_index.js.html#line56">line 56</a>
+    </li></ul></dd>
+    
+
+    
+
+    
+
+    
+</dl>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+    </div>
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+        <h3 class="subsection-title">Methods</h3>
+
+        
+            
+
+    
+
+    
+    <h4 class="name" id="_move"><span class="type-signature">(async) </span>_move<span class="signature">()</span><span class="type-signature"></span></h4>
+    
+
+    
+
+
+
+<div class="description">
+    <p>Move a file or folder. In case of a file, content is unchanged.</p>
+<p>On GNU/Linux, it should be possible to prevent overwriting the destination
+using the <code>RENAME_NOREPLACE</code> flag:
+http://man7.org/linux/man-pages/man2/rename.2.html</p>
+<p>But since Node's <code>fs.rename()</code> doesn't expose any option, the current
+implementation uses a separate <code>fs.stat()</code> step, which means it doesn't
+prevent race conditions:
+https://nodejs.org/dist/latest-v8.x/docs/api/fs.html#fs_fs_rename_oldpath_newpath_callback
+https://nodejs.org/dist/latest-v8.x/docs/api/fs.html#fs_fs_stat_path_callback</p>
+<p>TODO: atomic local destination check + move</p>
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<dl class="details">
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+    <dt class="tag-source">Source:</dt>
+    <dd class="tag-source"><ul class="dummy"><li>
+        <a href="core_local_index.js.html">core/local/index.js</a>, <a href="core_local_index.js.html#line383">line 383</a>
+    </li></ul></dd>
+    
+
+    
+
+    
+
+    
+</dl>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+            
+
+    
+
+    
+    <h4 class="name" id="moveFileAsync"><span class="type-signature">(async) </span>moveFileAsync<span class="signature">()</span><span class="type-signature"></span></h4>
+    
+
+    
+
+
+
+<div class="description">
+    <p>Move a file, eventually updating its content</p>
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<dl class="details">
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+    <dt class="tag-source">Source:</dt>
+    <dd class="tag-source"><ul class="dummy"><li>
+        <a href="core_local_index.js.html">core/local/index.js</a>, <a href="core_local_index.js.html#line352">line 352</a>
+    </li></ul></dd>
+    
+
+    
+
+    
+
+    
+</dl>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+            
+
+    
+
+    
+    <h4 class="name" id="moveFolderAsync"><span class="type-signature">(async) </span>moveFolderAsync<span class="signature">()</span><span class="type-signature"></span></h4>
+    
+
+    
+
+
+
+<div class="description">
+    <p>Move a folder</p>
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<dl class="details">
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+    <dt class="tag-source">Source:</dt>
+    <dd class="tag-source"><ul class="dummy"><li>
+        <a href="core_local_index.js.html">core/local/index.js</a>, <a href="core_local_index.js.html#line361">line 361</a>
+    </li></ul></dd>
+    
+
+    
+
+    
+
+    
+</dl>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+    
+
+    
+
+    
+</article>
+
+</section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_win_identical_renaming.html">core/local/atom/win_identical_renaming</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_sync.html">core/sync</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module.exports.html">exports</a></li><li><a href="module-core_app-App.html">App</a></li><li><a href="module-core_config-Config.html">Config</a></li><li><a href="module-core_local-Local.html">Local</a></li><li><a href="module-core_sync-Sync.html">Sync</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_getAuthorizationForm">_getAuthorizationForm</a></li><li><a href="global.html#_getCsrfToken">_getCsrfToken</a></li><li><a href="global.html#authorize">authorize</a></li><li><a href="global.html#automatedRegistration">automatedRegistration</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#login">login</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#only">only</a></li><li><a href="global.html#producer">producer</a></li><li><a href="global.html#steps">steps</a></li><li><a href="global.html#UPDATE_CHECK_TIMEOUT">UPDATE_CHECK_TIMEOUT</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/metadata.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/metadata.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/** Metadata of synchronized files &amp; directories.
+ *
+ * @module core/metadata
+ * @flow
+ */
+
+const _ = require('lodash')
+const { clone } = _
+const mime = require('mime')
+const deepDiff = require('deep-diff').diff
+const path = require('path')
+
+const {
+  detectPathIssues,
+  detectPathLengthIssue
+} = require('./path_restrictions')
+const { DIR_TYPE, FILE_TYPE } = require('./remote/constants')
+const logger = require('./utils/logger')
+const timestamp = require('./utils/timestamp')
+
+const fsutils = require('./utils/fs')
+/*::
+import type fs from 'fs'
+import type { PathIssue } from './path_restrictions'
+import type { RemoteDoc } from './remote/document'
+import type { Stats } from './local/stater'
+import type { Ignore } from './ignore'
+*/
+
+const log = logger({
+  component: 'Metadata'
+})
+
+const { platform } = process
+
+const CONFLICT_REGEXP = /-conflict-\d{4}(?:-\d{2}){2}T(?:\d{2}_?){3}\.\d{3}Z/
+
+/*::
+export type SideName =
+  | "local"
+  | "remote";
+export type DocType =
+  | "file"
+  | "folder";
+
+export type MetadataRemoteInfo = {
+  _id: string,
+  _rev: string
+}
+
+type RemoteID = string
+type RemoteRev = string
+export type RemoteRevisionsByID = { [RemoteID] : RemoteRev}
+
+export type MetadataSidesInfo = {
+  remote?: number,
+  local?: number
+}
+
+// The files/dirs metadata, as stored in PouchDB
+export type Metadata = {
+  _deleted?: true,
+  _id: string,
+  _rev?: string,
+  md5sum?: string,
+  class?: string,
+  docType: DocType,
+  errors?: number,
+  executable?: true,
+  updated_at: string,
+  mime?: string,
+  moveTo?: string, // Destination id
+  overwrite?: Metadata,
+  childMove?: boolean,
+  path: string,
+  remote: MetadataRemoteInfo,
+  size?: number,
+  tags?: string[],
+  sides: MetadataSidesInfo,
+  trashed?: true,
+  incompatibilities?: *,
+  ino?: ?number,
+  fileid?: ?string,
+  moveFrom?: Metadata
+}
+*/
+
+let id /*: string => string */ = () => ''
+
+// See [test/world/](https://github.com/cozy-labs/cozy-desktop/blob/master/test/world/)
+// for file system behavior examples.
+switch (platform) {
+  case 'linux':
+  case 'freebsd':
+  case 'sunos':
+    id = idUnix
+    break
+  case 'darwin':
+    id = idApfsOrHfs
+    break
+  case 'win32':
+    id = idNTFS
+    break
+  default:
+    throw new Error(`Sorry, ${platform} is not supported!`)
+}
+
+module.exports = {
+  assignId,
+  assignMaxDate,
+  assignPlatformIncompatibilities,
+  fromRemoteDoc,
+  isFile,
+  id,
+  invalidPath,
+  invariants,
+  ensureValidPath,
+  detectPlatformIncompatibilities,
+  invalidChecksum,
+  ensureValidChecksum,
+  extractRevNumber,
+  isUpToDate,
+  isAtLeastUpToDate,
+  markAsNew,
+  markAsUnsyncable,
+  markAsUpToDate,
+  sameFolder,
+  sameFile,
+  sameFileIgnoreRev,
+  sameBinary,
+  markSide,
+  incSides,
+  wasSynced,
+  buildDir,
+  buildFile,
+  upToDate,
+  outOfDateSide,
+  createConflictingDoc,
+  CONFLICT_REGEXP,
+  shouldIgnore
+}
+
+function localDocType(remoteDocType /*: string */) /*: string */ {
+  switch (remoteDocType) {
+    case FILE_TYPE:
+      return 'file'
+    case DIR_TYPE:
+      return 'folder'
+    default:
+      throw new Error(`Unexpected Cozy Files type: ${remoteDocType}`)
+  }
+}
+
+// Transform a remote document into metadata, as stored in Pouch.
+// Please note the path is not normalized yet!
+// Normalization is done as a side effect of metadata.invalidPath() :/
+function fromRemoteDoc(remoteDoc /*: RemoteDoc */) /*: Metadata */ {
+  const doc /*: Object */ = {
+    path: remoteDoc.path.substring(1),
+    docType: localDocType(remoteDoc.type),
+    updated_at: remoteDoc.updated_at,
+    remote: {
+      _id: remoteDoc._id,
+      _rev: remoteDoc._rev
+    }
+  }
+
+  if (remoteDoc.size) {
+    doc.size = parseInt(remoteDoc.size, 10)
+  }
+
+  for (let field of ['md5sum', 'executable', 'class', 'mime', 'tags']) {
+    if (remoteDoc[field]) {
+      doc[field] = remoteDoc[field]
+    }
+  }
+
+  return doc
+}
+
+function isFile(doc /*: Metadata */) /*: bool */ {
+  return doc.docType === 'file'
+}
+
+// Build an _id from the path for a case sensitive file system (Linux, BSD)
+function idUnix(fpath /*: string */) {
+  return fpath
+}
+
+// Build an _id from the path for macOS, assuming file system is either APFS
+// or HFS+.
+//
+// APFS:
+// - case preservative, but not case sensitive
+// - unicode normalization preservative, but not sensitive
+//
+// HFS+:
+// - case preservative, but not case sensitive
+// - unicode NFD normalization (sort of)
+//
+// See https://nodejs.org/en/docs/guides/working-with-different-filesystems/
+// for why toUpperCase is better than toLowerCase
+//
+// We are using NFD (Normalization Form Canonical Decomposition), but NFC
+// would be fine too. We just need to make sure that 2 files which cannot
+// coexist on APFS or HFS+ have the same identity.
+//
+// Note: String.prototype.normalize is not available on node 0.10 and does
+// nothing when node is compiled without intl option.
+function idApfsOrHfs(fpath /*: string */) {
+  let id = fpath
+  if (id.normalize) {
+    id = id.normalize('NFD')
+  }
+  return id.toUpperCase()
+}
+
+// Build an _id from the path for Windows (NTFS file system)
+function idNTFS(fpath /*: string */) {
+  return fpath.toUpperCase()
+}
+
+// Assign an Id to a document
+function assignId(doc /*: any */) {
+  doc._id = id(doc.path)
+}
+
+// Return true if the document has not a valid path
+// (ie a path inside the mount point).
+// Normalizes the path as a side-effect.
+// TODO: Separate normalization (side-effect) from validation (pure).
+function invalidPath(doc /*: {path: string} */) {
+  if (!doc.path) {
+    return true
+  }
+  doc.path = path.normalize(doc.path)
+  if (doc.path.startsWith(path.sep)) {
+    doc.path = doc.path.slice(1)
+  }
+  let parts = doc.path.split(path.sep)
+  return doc.path === '.' || doc.path === '' || parts.indexOf('..') >= 0
+}
+
+// Same as invalidPath, except it throws an exception when path is invalid.
+function ensureValidPath(doc /*: {path: string} */) {
+  if (invalidPath(doc)) {
+    log.warn(
+      { path: doc.path },
+      `Invalid path: ${JSON.stringify(doc, null, 2)}`
+    )
+    throw new Error('Invalid path')
+  }
+}
+
+function invariants(doc /*: Metadata */) {
+  let err
+  if (!doc.sides) {
+    err = new Error(`Metadata has no sides`)
+  } else if (doc.sides.remote &amp;&amp; !doc.remote) {
+    err = new Error(`Metadata has 'sides.remote' but no remote`)
+  } else if (doc.docType === 'file' &amp;&amp; doc.md5sum == null) {
+    err = new Error(`File metadata has no checksum`)
+  }
+
+  if (err) {
+    log.error({ err, path: doc.path, sentry: true }, err.message)
+    throw err
+  }
+
+  return doc
+}
+
+/*::
+export type PlatformIncompatibility = PathIssue &amp; {docType: string}
+*/
+
+// Identifies platform incompatibilities in metadata that will prevent local
+// synchronization
+// TODO: return null instead of an empty array when no issue was found?
+function detectPlatformIncompatibilities(
+  metadata /*: Metadata */,
+  syncPath /*: string */
+) /*: Array&lt;PlatformIncompatibility> */ {
+  const pathLenghIssue = detectPathLengthIssue(
+    path.join(syncPath, metadata.path),
+    platform
+  )
+  const issues /*: PathIssue[] */ = detectPathIssues(
+    metadata.path,
+    metadata.docType
+  )
+  if (pathLenghIssue) issues.unshift(pathLenghIssue)
+  return issues.map(issue =>
+    _.merge(
+      {
+        docType: issue.path === metadata.path ? metadata.docType : 'folder'
+      },
+      issue
+    )
+  )
+}
+
+function assignPlatformIncompatibilities(
+  doc /*: Metadata */,
+  syncPath /*: string */
+) /*: void */ {
+  const incompatibilities = detectPlatformIncompatibilities(doc, syncPath)
+  if (incompatibilities.length > 0) doc.incompatibilities = incompatibilities
+}
+
+// Return true if the checksum is invalid
+// If the checksum is missing, it is invalid.
+// MD5 has 16 bytes.
+// Base64 encoding must include padding.
+function invalidChecksum(doc /*: Metadata */) {
+  if (doc.md5sum == null) return doc.docType === 'file'
+
+  const buffer = Buffer.from(doc.md5sum, 'base64')
+
+  return buffer.byteLength !== 16 || buffer.toString('base64') !== doc.md5sum
+}
+
+function ensureValidChecksum(doc /*: Metadata */) {
+  if (invalidChecksum(doc)) {
+    log.warn({ path: doc.path, doc }, 'Invalid checksum')
+    throw new Error('Invalid checksum')
+  }
+}
+
+// Extract the revision number, or 0 it not found
+function extractRevNumber(doc /*: Metadata|{_rev: string} */) {
+  try {
+    // $FlowFixMe
+    let rev = doc._rev.split('-')[0]
+    return Number(rev)
+  } catch (error) {
+    return 0
+  }
+}
+
+// Return true if the remote file is up-to-date for this document
+function isUpToDate(side /*: SideName */, doc /*: Metadata */) {
+  let currentRev = doc.sides[side] || 0
+  let lastRev = extractRevNumber(doc)
+  return currentRev === lastRev
+}
+
+function isAtLeastUpToDate(side /*: SideName */, doc /*: Metadata */) {
+  let currentRev = doc.sides[side] || 0
+  let lastRev = extractRevNumber(doc)
+  return currentRev >= lastRev
+}
+
+function markAsUnsyncable(side /*: SideName */, doc /*: Metadata */) {
+  doc._deleted = true
+  markSide(side, doc, doc)
+}
+
+function markAsNew(doc /*: Metadata */) {
+  delete doc._rev
+  delete doc.sides
+}
+
+function markAsUpToDate(doc /*: Metadata */) {
+  let rev = extractRevNumber(doc) + 1
+  for (let s of ['local', 'remote']) {
+    doc.sides[s] = rev
+  }
+  delete doc.errors
+  return rev
+}
+
+function upToDate(doc /*: Metadata */) /*: Metadata */ {
+  const clone = _.clone(doc)
+  const rev = Math.max(clone.sides.local, clone.sides.remote)
+
+  return _.assign(clone, {
+    errors: undefined,
+    sides: { local: rev, remote: rev }
+  })
+}
+
+function outOfDateSide(doc /*: Metadata */) /*: ?SideName */ {
+  const localRev = _.get(doc, 'sides.local', 0)
+  const remoteRev = _.get(doc, 'sides.remote', 0)
+  if ((localRev === 0 || remoteRev === 0) &amp;&amp; doc._deleted) {
+    return null
+  } else if (localRev > remoteRev) {
+    return 'remote'
+  } else if (remoteRev > localRev) {
+    return 'local'
+  }
+}
+
+// Ensure new timestamp is never older than the previous one
+function assignMaxDate(doc /*: Metadata */, was /*: ?Metadata */) {
+  if (was == null) return
+  const wasUpdatedAt = new Date(was.updated_at)
+  const docUpdatedAt = new Date(doc.updated_at)
+  if (docUpdatedAt &lt; wasUpdatedAt) {
+    doc.updated_at = was.updated_at
+  }
+}
+
+const ensureExecutable = (one, two) => {
+  two =
+    process.platform === 'win32'
+      ? _.defaults({ executable: one.executable }, two)
+      : two
+  return [
+    _.merge({ executable: !!one.executable }, one),
+    _.merge({ executable: !!two.executable }, two)
+  ]
+}
+
+const makeComparator = (name, interestingFields) => {
+  const interestingPaths = interestingFields.map(f => f.split('.'))
+  const filter = (path, key) => {
+    return !interestingPaths.some(interestingPath => {
+      return interestingPath.every((part, i) => {
+        if (i &lt; path.length) return path[i] === part
+        if (i === path.length) return key === part
+        return true
+      })
+    })
+  }
+  const canBeIgnoredDiff = difference => {
+    const diff = difference.item || difference
+    return _.isNil(diff.lhs) &amp;&amp; _.isNil(diff.rhs)
+  }
+  return (one, two) => {
+    const diff = deepDiff(one, two, filter)
+    log.trace({ path: two.path, diff }, name)
+    if (diff &amp;&amp; !_.every(diff, canBeIgnoredDiff)) {
+      return false
+    }
+    // XXX The fileid can be missing in some old documents in pouchdb.
+    // So, we compare them only if it's present on both documents.
+    if (process.platform === 'win32' &amp;&amp; one.fileid &amp;&amp; two.fileid) {
+      return one.fileid === two.fileid
+    }
+    return true
+  }
+}
+
+const sameFolderComparator = makeComparator('sameFolder', [
+  'path',
+  'docType',
+  'remote',
+  'tags',
+  'trashed',
+  'ino'
+])
+
+// Return true if the metadata of the two folders are the same
+function sameFolder(one /*: Metadata */, two /*: Metadata */) {
+  return sameFolderComparator(one, two)
+}
+
+const sameFileComparator = makeComparator('sameFile', [
+  'path',
+  'docType',
+  'md5sum',
+  'remote._id',
+  'remote._rev',
+  'tags',
+  'size',
+  'trashed',
+  'ino',
+  'executable'
+])
+
+const sameFileIgnoreRevComparator = makeComparator('sameFileIgnoreRev', [
+  'path',
+  'docType',
+  'md5sum',
+  'remote._id',
+  'tags',
+  'size',
+  'trashed',
+  'ino',
+  'executable'
+])
+
+// Return true if the metadata of the two files are the same
+function sameFile(one /*: Metadata */, two /*: Metadata */) {
+  ;[one, two] = ensureExecutable(one, two)
+  return sameFileComparator(one, two)
+}
+
+// Return true if the metadata of the two files are the same,
+// ignoring revision
+function sameFileIgnoreRev(one /*: Metadata */, two /*: Metadata */) {
+  ;[one, two] = ensureExecutable(one, two)
+  return sameFileIgnoreRevComparator(one, two)
+}
+
+// Return true if the two files have the same binary content
+function sameBinary(one /*: Metadata */, two /*: Metadata */) {
+  return one.md5sum === two.md5sum
+}
+
+// Mark the next rev for this side
+//
+// To track which side has made which modification, a revision number is
+// associated to each side. When a side make a modification, we extract the
+// revision from the previous state, increment it by one to have the next
+// revision and associate this number to the side that makes the
+// modification.
+function markSide(
+  side /*: string */,
+  doc /*: Metadata */,
+  prev /*: ?Metadata */
+) /*: Metadata */ {
+  let rev = 0
+  if (prev) {
+    rev = extractRevNumber(prev)
+  }
+  if (doc.sides == null) {
+    const was = prev &amp;&amp; prev.sides
+    doc.sides = clone(was || {})
+  }
+  doc.sides[side] = ++rev
+  return doc
+}
+
+function incSides(doc /*: {sides?: MetadataSidesInfo} */) /*: void */ {
+  doc.sides = {
+    local: side(doc, 'local') + 1,
+    remote: side(doc, 'remote') + 1
+  }
+}
+
+function side(
+  doc /*: {sides?: MetadataSidesInfo} */,
+  sideName /*: SideName */
+) /*: number */ {
+  return (doc.sides || {})[sideName] || 0
+}
+
+function wasSynced(doc /*: Metadata */) /*: boolean */ {
+  const hasBothSides /*: boolean */ =
+    doc.sides &amp;&amp; doc.sides.local != null &amp;&amp; doc.sides.remote != null
+  const comesFromSyncedDoc /*: boolean */ = doc.moveFrom != null
+
+  return hasBothSides || comesFromSyncedDoc
+}
+
+function buildDir(
+  fpath /*: string */,
+  stats /*: Stats */,
+  remote /*: ?MetadataRemoteInfo */
+) /*: Metadata */ {
+  const doc /*: Object */ = {
+    _id: id(fpath),
+    path: fpath,
+    docType: 'folder',
+    updated_at: timestamp
+      .fromDate(timestamp.maxDate(stats.mtime, stats.ctime))
+      .toISOString(),
+    ino: stats.ino,
+    remote
+  }
+  if (stats.fileid) {
+    doc.fileid = stats.fileid
+  }
+  return doc
+}
+
+const EXECUTABLE_MASK = 1 &lt;&lt; 6
+
+function buildFile(
+  filePath /*: string */,
+  stats /*: Stats */,
+  md5sum /*: string */,
+  remote /*: ?MetadataRemoteInfo */
+) /*: Metadata */ {
+  const mimeType = mime.lookup(filePath)
+  const { mtime, ctime } = stats
+  const doc /*: Object */ = {
+    _id: id(filePath),
+    path: filePath,
+    docType: 'file',
+    md5sum,
+    ino: stats.ino,
+    updated_at: timestamp
+      .fromDate(timestamp.maxDate(mtime, ctime))
+      .toISOString(),
+    mime: mimeType,
+    class: mimeType.split('/')[0],
+    size: stats.size,
+    remote
+  }
+  if (stats.mode &amp;&amp; (+stats.mode &amp; EXECUTABLE_MASK) !== 0) {
+    doc.executable = true
+  }
+  if (stats.fileid) {
+    doc.fileid = stats.fileid
+  }
+  return doc
+}
+
+function createConflictingDoc(doc /*: Metadata */) /*: Metadata */ {
+  const newPath = CONFLICT_REGEXP.test(doc.path)
+    ? replacePreviousConflictSuffix(doc.path)
+    : addConflictSuffix(doc.path)
+
+  return {
+    ...doc,
+    path: newPath,
+    _id: id(newPath)
+  }
+}
+
+function conflictSuffix() /*: string */ {
+  const date = fsutils.validName(new Date().toISOString())
+  return `-conflict-${date}`
+}
+
+function replacePreviousConflictSuffix(filePath /*: string */) /*: string */ {
+  return filePath.replace(CONFLICT_REGEXP, conflictSuffix())
+}
+
+function addConflictSuffix(filePath /*: string */) /*: string */ {
+  const dirname = path.dirname(filePath)
+  const extname = path.extname(filePath)
+  const filename = path.basename(filePath, extname)
+  const notTooLongFilename = filename.slice(0, 180)
+  return `${path.join(
+    dirname,
+    notTooLongFilename
+  )}${conflictSuffix()}${extname}`
+}
+
+function shouldIgnore(
+  doc /*: Metadata */,
+  ignoreRules /*: Ignore */
+) /*: boolean */ {
+  return ignoreRules.isIgnored({
+    relativePath: doc._id,
+    isFolder: doc.docType === 'folder'
+  })
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js__help.window_.html">gui/js/"help.window"</a></li><li><a href="module-gui_js__onboarding.window_.html">gui/js/"onboarding.window"</a></li><li><a href="module-gui_js__tray.window_.html">gui/js/"tray.window"</a></li><li><a href="module-gui_js__updated.window_.html">gui/js/"updated.window"</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_">_</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#fixIdenticalRenamed">fixIdenticalRenamed</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#ignoreDeletedBeforeIdenticalRenamed">ignoreDeletedBeforeIdenticalRenamed</a></li><li><a href="global.html#indexDeletedEvent">indexDeletedEvent</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#Promise">Promise</a></li><li><a href="global.html#rotateState">rotateState</a></li><li><a href="global.html#step">step</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: test/support/helpers/scenarios.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: test/support/helpers/scenarios.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const Promise = require('bluebird')
+const fse = require('fs-extra')
+const glob = require('glob')
+const _ = require('lodash')
+const path = require('path')
+const crypto = require('crypto')
+const mergedirs = require('merge-dirs').default
+
+const stater = require('../../../core/local/stater')
+const metadata = require('../../../core/metadata')
+
+const { cozy } = require('./cozy')
+
+// eslint-disable-next-line no-console
+const debug = process.env.TESTDEBUG ? console.log : () => {}
+
+const scenariosDir = path.resolve(__dirname, '../../scenarios')
+
+const scenarioByPath = (module.exports.scenarioByPath = scenarioPath => {
+  // $FlowFixMe
+  const scenario = require(scenarioPath)
+  scenario.name = path
+    .dirname(path.normalize(scenarioPath))
+    .replace(scenariosDir + path.sep, '')
+    .replace(/\\/g, '/')
+  scenario.path = scenarioPath
+
+  if (
+    process.platform === 'win32' &amp;&amp;
+    scenario.expected &amp;&amp;
+    scenario.expected.prepCalls
+  ) {
+    for (let prepCall of scenario.expected.prepCalls) {
+      if (prepCall.src) {
+        prepCall.src = prepCall.src.split('/').join('\\')
+        // @TODO why is src in maj
+      }
+      if (prepCall.path) prepCall.path = prepCall.path.split('/').join('\\')
+      if (prepCall.dst) prepCall.dst = prepCall.dst.split('/').join('\\')
+    }
+  }
+
+  return scenario
+})
+
+const statsFixer = event => {
+  if (event.stats) {
+    event.stats = _.defaultsDeep(
+      {
+        atime: new Date(event.stats.atime),
+        mtime: new Date(event.stats.mtime),
+        ctime: new Date(event.stats.ctime),
+        birthtime: new Date(event.stats.birthtime)
+      },
+      event.stats
+    )
+  }
+}
+
+const windowsPathFixer = (filename, event) => {
+  if (filename.indexOf('win32') !== -1 &amp;&amp; process.platform !== 'win32') {
+    if (event.path) event.path = event.path.replace(/\\/g, '/')
+    if (event.oldPath) event.oldPath = event.oldPath.replace(/\\/g, '/')
+  }
+  if (filename.indexOf('win32') === -1 &amp;&amp; process.platform === 'win32') {
+    if (event.path) event.path = event.path.replace(/\//g, '\\')
+    if (event.oldPath) event.oldPath = event.oldPath.replace(/\//g, '\\')
+  }
+}
+
+// TODO: Refactor to function
+module.exports.scenarios = glob
+  .sync(path.join(scenariosDir, '**/scenario.js*'), {})
+  .map(scenarioByPath)
+
+if (module.exports.scenarios.length === 0) {
+  throw new Error(
+    `No scenario found! Please check scenariosDir: ${scenariosDir}`
+  )
+}
+
+const disabledScenario = scenario =>
+  typeof scenario.disabled === 'string' &amp;&amp; scenario.disabled
+
+/**
+ * For historical reasons, `disabledScenarioTest()` may receive test names
+ * with file extension. Although it may be useless in many cases, stripping
+ * them will make sure code always works.
+ */
+const disabledScenarioTest = (scenario, testName) =>
+  disabledScenario(scenario) ||
+  _.get(scenario, ['disabled', testName.replace(path.extname(testName), '')])
+
+module.exports.disabledScenarioTest = disabledScenarioTest
+
+module.exports.loadFSEventFiles = scenario => {
+  const eventFiles = glob.sync(
+    path.join(path.dirname(scenario.path), 'local', '*.json*')
+  )
+  const disabledEventsFile = name => {
+    if (process.platform === 'win32' &amp;&amp; name.indexOf('win32') === -1) {
+      return 'darwin/linux test'
+    } else {
+      return disabledScenarioTest(scenario, `local/${name}`)
+    }
+  }
+  return eventFiles.map(f => {
+    const name = path.basename(f)
+    const disabled = disabledScenario(scenario) || disabledEventsFile(name)
+    const events = fse.readJsonSync(f).map(e => {
+      statsFixer(e)
+      windowsPathFixer(name, e)
+      return e
+    })
+
+    return { name, events, disabled }
+  })
+}
+
+module.exports.loadAtomCaptures = scenario => {
+  const eventFiles = glob.sync(
+    path.join(path.dirname(scenario.path), 'atom', '*.json*')
+  )
+  const disabledEventsFile = name => {
+    if (process.platform === 'win32' &amp;&amp; name.indexOf('win32') === -1) {
+      return 'linux test'
+    } else if (process.platform === 'linux' &amp;&amp; name.indexOf('win32') >= 0) {
+      return 'win32 test'
+    } else {
+      return disabledScenarioTest(scenario, `atom/${name}`)
+    }
+  }
+  return eventFiles.map(f => {
+    const name = path.basename(f)
+    const disabled = disabledScenario(scenario) || disabledEventsFile(name)
+    const batches = fse.readJsonSync(f).map(batch =>
+      batch.map(event => {
+        statsFixer(event)
+        windowsPathFixer(name, event)
+        return event
+      })
+    )
+
+    return { name, batches, disabled }
+  })
+}
+
+module.exports.loadRemoteChangesFiles = scenario => {
+  const pattern = path.join(path.dirname(scenario.path), 'remote', '*.json*')
+
+  return glob.sync(pattern).map(f => {
+    const name = path.basename(f)
+    const disabled = disabledScenarioTest(scenario, 'remote')
+    const changes = fse.readJsonSync(f)
+    return { name, disabled, changes }
+  })
+}
+
+const getInoAndFileId = async ({ path, fakeIno, trashed, useRealInodes }) => {
+  if (trashed || !useRealInodes) {
+    return { ino: fakeIno }
+  } else {
+    return stater.stat(path)
+  }
+}
+
+module.exports.init = async (
+  scenario,
+  pouch,
+  abspath,
+  relpathFix,
+  useRealInodes
+) => {
+  debug('[init]')
+  const remoteDocsToTrash = []
+  for (let { path: relpath, ino: fakeIno, trashed, content } of scenario.init) {
+    debug(relpath)
+    const isOutside = relpath.startsWith('../outside')
+    let remoteParent
+    if (!isOutside) {
+      const remoteParentPath = path.posix.join('/', path.posix.dirname(relpath))
+      debug(`- retrieve remote parent: ${remoteParentPath}`)
+      remoteParent = await cozy.files.statByPath(remoteParentPath)
+    }
+    const remoteName = path.posix.basename(relpath)
+    const remotePath = path.posix.join(
+      _.get(remoteParent, 'attributes.path', ''),
+      remoteName
+    )
+    const localPath = relpathFix(_.trimEnd(relpath, '/'))
+    const lastModifiedDate = new Date('2011-04-11T10:20:30Z')
+    if (relpath.endsWith('/')) {
+      if (!trashed) {
+        debug(`- create local dir: ${localPath}`)
+        await fse.ensureDir(abspath(localPath))
+      }
+
+      const stats = await getInoAndFileId({
+        path: abspath(localPath),
+        fakeIno,
+        trashed,
+        useRealInodes
+      })
+      const doc = {
+        _id: metadata.id(localPath),
+        docType: 'folder',
+        updated_at: lastModifiedDate,
+        path: localPath,
+        tags: [],
+        sides: { local: 1, remote: 1 }
+      }
+      stater.assignInoAndFileId(doc, stats)
+
+      if (!isOutside) {
+        debug(
+          `- create${trashed ? ' and trash' : ''} remote dir: ${remotePath}`
+        )
+        const remoteDir = await cozy.files.createDirectory({
+          name: remoteName,
+          dirID: remoteParent._id,
+          lastModifiedDate
+        })
+        doc.remote = _.pick(remoteDir, ['_id', '_rev'])
+        if (trashed) remoteDocsToTrash.push(remoteDir)
+        else {
+          debug(`- create dir metadata: ${doc._id}`)
+          await pouch.put(doc)
+        }
+      }
+    } else {
+      let md5sum
+      if (!content) {
+        content = 'foo'
+        md5sum = 'rL0Y20zC+Fzt72VPzMSk2A=='
+      } else {
+        md5sum = crypto
+          .createHash('md5')
+          .update(content)
+          .digest()
+          .toString('base64')
+      }
+
+      if (!trashed) {
+        debug(`- create local file: ${localPath}`)
+        await fse.outputFile(abspath(localPath), content)
+      }
+
+      const stats = await getInoAndFileId({
+        path: abspath(localPath),
+        fakeIno,
+        trashed,
+        useRealInodes
+      })
+      const doc = {
+        _id: metadata.id(localPath),
+        md5sum,
+        class: 'text',
+        docType: 'file',
+        executable: false,
+        updated_at: lastModifiedDate,
+        mime: 'text/plain',
+        path: localPath,
+        size: content.length,
+        tags: [],
+        sides: { local: 1, remote: 1 }
+      }
+      stater.assignInoAndFileId(doc, stats)
+      if (!isOutside) {
+        debug(
+          `- create${trashed ? ' and trash' : ''} remote file: ${remotePath}`
+        )
+        const remoteFile = await cozy.files.create(content, {
+          name: remoteName,
+          dirID: remoteParent._id,
+          checksum: md5sum,
+          contentType: 'text/plain',
+          lastModifiedDate
+        })
+        doc.remote = _.pick(remoteFile, ['_id', '_rev'])
+        if (trashed) remoteDocsToTrash.push(remoteFile)
+        else {
+          debug(`- create file metadata: ${doc._id}`)
+          await pouch.put(doc)
+        }
+      }
+    } // if relpath ...
+  } // for (... of scenario.init)
+  for (let remoteDoc of remoteDocsToTrash) {
+    await cozy.files.trashById(remoteDoc._id)
+  }
+}
+
+module.exports.runActions = (
+  scenario,
+  abspath,
+  opts /*: {skipWait?: true} */ = {}
+) => {
+  debug('[actions]')
+  return Promise.each(scenario.actions, action => {
+    switch (action.type) {
+      case 'mkdir':
+        debug('- mkdir', action.path)
+        return fse.ensureDir(abspath(action.path))
+
+      case 'create_file':
+        debug('- create_file', action.path)
+        return fse.outputFile(
+          abspath(action.path),
+          action.content || 'whatever'
+        )
+
+      case 'update_file':
+        debug('- update_file', action.path)
+        return fse.writeFile(abspath(action.path), action.content)
+
+      case 'trash':
+        debug('- trash', action.path)
+        return fse.remove(abspath(action.path))
+
+      case 'delete':
+        debug('- delete', action.path)
+        return fse.remove(abspath(action.path))
+
+      case 'mv':
+        debug('- mv', action.force ? 'force' : '', action.src, action.dst)
+        if (action.merge) {
+          // FIXME: Does this preserve inode ?
+          mergedirs(abspath(action.src), abspath(action.dst), 'overwrite')
+          return fse.remove(abspath(action.src))
+        } else if (action.force) {
+          return fse.move(abspath(action.src), abspath(action.dst), {
+            overwrite: true
+          })
+        } else {
+          return fse.rename(abspath(action.src), abspath(action.dst))
+        }
+
+      case 'wait':
+        if (opts.skipWait) return Promise.resolve()
+        debug('- wait', action.ms)
+        return Promise.delay(action.ms)
+
+      default:
+        return Promise.reject(
+          new Error(
+            `Unknown action ${action.type} for scenario ${scenario.name}`
+          )
+        )
+    }
+  })
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js__help.window_.html">gui/js/"help.window"</a></li><li><a href="module-gui_js__onboarding.window_.html">gui/js/"onboarding.window"</a></li><li><a href="module-gui_js__tray.window_.html">gui/js/"tray.window"</a></li><li><a href="module-gui_js__updated.window_.html">gui/js/"updated.window"</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_">_</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#fixIdenticalRenamed">fixIdenticalRenamed</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#ignoreDeletedBeforeIdenticalRenamed">ignoreDeletedBeforeIdenticalRenamed</a></li><li><a href="global.html#indexDeletedEvent">indexDeletedEvent</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#Promise">Promise</a></li><li><a href="global.html#rotateState">rotateState</a></li><li><a href="global.html#step">step</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

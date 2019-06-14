@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/local/chokidar/watcher.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/local/chokidar/watcher.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * @module core/local/chokidar/watcher
+ * @flow
+ */
+
+const autoBind = require('auto-bind')
+const Promise = require('bluebird')
+const chokidar = require('chokidar')
+const fse = require('fs-extra')
+const path = require('path')
+
+const analysis = require('./analysis')
+const checksumer = require('../checksumer')
+const chokidarEvent = require('./event')
+const LocalEventBuffer = require('./event_buffer')
+const initialScan = require('./initial_scan')
+const prepareEvents = require('./prepare_events')
+const sendToPrep = require('./send_to_prep')
+const syncDir = require('../sync_dir')
+const logger = require('../../utils/logger')
+
+/*::
+import type { Metadata } from '../../metadata'
+import type Pouch from '../../pouch'
+import type Prep from '../../prep'
+import type { Checksumer } from '../checksumer'
+import type { ChokidarEvent } from './event'
+import type { InitialScan } from './initial_scan'
+import type { LocalEvent } from './local_event'
+import type { LocalChange } from './local_change'
+import type EventEmitter from 'events'
+*/
+
+const log = logger({
+  component: 'ChokidarWatcher'
+})
+log.chokidar = log.child({
+  component: 'Chokidar'
+})
+
+// This file contains the filesystem watcher that will trigger operations when
+// a file or a folder is added/removed/changed locally.
+// Operations will be added to the a common operation queue along with the
+// remote operations triggered by the remoteEventWatcher.
+module.exports = class LocalWatcher {
+  /*::
+  syncPath: string
+  prep: Prep
+  pouch: Pouch
+  events: EventEmitter
+  initialScan: ?InitialScan
+  checksumer: Checksumer
+  watcher: any // chokidar
+  buffer: LocalEventBuffer&lt;ChokidarEvent>
+  pendingChanges: LocalChange[]
+  running: Promise&lt;void>
+  _runningResolve: ?Function
+  _runningReject: ?Function
+  */
+
+  constructor(
+    syncPath /*: string */,
+    prep /*: Prep */,
+    pouch /*: Pouch */,
+    events /*: EventEmitter */
+  ) {
+    this.syncPath = syncPath
+    this.prep = prep
+    this.pouch = pouch
+    this.events = events
+    this.checksumer = checksumer.init()
+    this.pendingChanges = []
+
+    // XXX: this.onFlush must be bound before being passed to LocalEventBuffer
+    autoBind(this)
+
+    // TODO: Read from config
+    const timeoutInMs = process.env.NODE_ENV === 'test' ? 1000 : 10000
+    this.buffer = new LocalEventBuffer(timeoutInMs, async rawEvents => {
+      try {
+        await this.onFlush(rawEvents)
+      } catch (err) {
+        log.error({ err }, 'onFlushError')
+        this._runningReject &amp;&amp; this._runningReject(err)
+      }
+    })
+  }
+
+  // Start chokidar, the filesystem watcher
+  // https://github.com/paulmillr/chokidar
+  start() {
+    log.debug('Starting...')
+
+    this.watcher = chokidar.watch('.', {
+      // Let paths in events be relative to this base path
+      cwd: this.syncPath,
+      // Ignore our own .system-tmp-cozy-drive directory
+      ignored: /(^|[\/\\])\.system-tmp-cozy-drive/, // eslint-disable-line no-useless-escape
+      // Don't follow symlinks
+      followSymlinks: false,
+      // The stats object is used in methods below
+      alwaysStat: true,
+      // Watching on Windows seems to lock dirs with subdirs, preventing them
+      // from being renamed/moved/deleted.
+      usePolling: process.platform === 'win32',
+      // Filter out artifacts from editors with atomic writes
+      atomic: true,
+      // Poll newly created files to detect when the write is finished
+      awaitWriteFinish: {
+        pollInterval: 200,
+        stabilityThreshold: 1000
+      },
+      // With node 0.10 on linux, only polling is available
+      interval: 1000,
+      binaryInterval: 2000
+    })
+
+    const started = new Promise(resolve => {
+      for (let eventType of [
+        'add',
+        'addDir',
+        'change',
+        'unlink',
+        'unlinkDir'
+      ]) {
+        this.watcher.on(eventType, (
+          path /*: ?string */,
+          stats /*: ?fse.Stats */
+        ) => {
+          const isInitialScan = this.initialScan &amp;&amp; !this.initialScan.flushed
+          log.chokidar.debug({ path, stats, isInitialScan }, eventType)
+          const newEvent = chokidarEvent.build(eventType, path, stats)
+          this.buffer.push(newEvent)
+          this.events.emit('buffering-start')
+        })
+      }
+
+      // To detect which files&amp;folders have been removed since the last run of
+      // cozy-desktop, we keep all the paths seen by chokidar during its
+      // initial scan in @paths to compare them with pouchdb database.
+      this.initialScan = {
+        ids: [],
+        emptyDirRetryCount: 3,
+        resolve,
+        flushed: false
+      }
+
+      this.watcher
+        .on('ready', () => this.buffer.switchMode('timeout'))
+        .on('raw', (event, path, details) =>
+          log.chokidar.debug({ event, path, details }, 'raw')
+        )
+        .on('error', err => {
+          if (err.message === 'watch ENOSPC') {
+            log.error(
+              'Sorry, the kernel is out of inotify watches! ' +
+                'See doc/usage/inotify.md for how to solve this issue.'
+            )
+          } else {
+            log.error({ err })
+          }
+        })
+
+      log.info(`Now watching ${this.syncPath}`)
+    })
+
+    this.running = new Promise((resolve, reject) => {
+      this._runningResolve = resolve
+      this._runningReject = reject
+    })
+    return started
+  }
+
+  // TODO: Start checksuming as soon as an add/change event is buffered
+  // TODO: Put flushed event batches in a queue
+  async onFlush(rawEvents /*: ChokidarEvent[] */) {
+    log.debug(`Flushed ${rawEvents.length} events`)
+
+    if (this.initialScan) this.initialScan.flushed = true
+    this.events.emit('buffering-end')
+    syncDir.ensureExistsSync(this)
+    this.events.emit('local-start')
+
+    const events = await initialScan.step(rawEvents, this)
+    if (!events) return
+
+    log.trace('Prepare events...')
+    const preparedEvents /*: LocalEvent[] */ = await prepareEvents.step(
+      events,
+      this
+    )
+    log.trace('Done with events preparation.')
+
+    const changes /*: LocalChange[] */ = analysis(
+      preparedEvents,
+      this.pendingChanges
+    )
+
+    // TODO: Don't even acquire lock changes list is empty
+    // FIXME: Shouldn't we acquire the lock before preparing the events?
+    const release = await this.pouch.lock(this)
+    let target = -1
+    try {
+      await sendToPrep.step(changes, this)
+      target = (await this.pouch.db.changes({ limit: 1, descending: true }))
+        .last_seq
+    } finally {
+      this.events.emit('sync-target', target)
+      release()
+      this.events.emit('local-end')
+    }
+    if (this.initialScan != null) {
+      this.initialScan.resolve()
+      this.initialScan = null
+    }
+  }
+
+  async stop(force /*: ?bool */) {
+    if (this.watcher) {
+      // XXX manually fire events for added file, because chokidar will cancel
+      // them if they are still in the awaitWriteFinish period
+      for (let relpath in this.watcher._pendingWrites) {
+        try {
+          const fullpath = path.join(this.watcher.options.cwd, relpath)
+          const curStat = await fse.stat(fullpath)
+          this.watcher.emit('add', relpath, curStat)
+        } catch (err) {
+          log.warn({ err }, 'Could not fire remaining add events')
+        }
+      }
+      this.watcher.close()
+      this.watcher = null
+    }
+    if (this._runningResolve) {
+      this._runningResolve()
+      this._runningResolve = null
+    }
+    this.buffer.switchMode('idle')
+    if (force) return Promise.resolve()
+    // Give some time for awaitWriteFinish events to be managed
+    return new Promise(resolve => {
+      setTimeout(resolve, 1000)
+    })
+  }
+
+  /* Helpers */
+  async checksum(filePath /*: string */) /*: Promise&lt;string> */ {
+    const absPath = path.join(this.syncPath, filePath)
+    return this.checksumer.push(absPath)
+  }
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js__help.window_.html">gui/js/"help.window"</a></li><li><a href="module-gui_js__onboarding.window_.html">gui/js/"onboarding.window"</a></li><li><a href="module-gui_js__tray.window_.html">gui/js/"tray.window"</a></li><li><a href="module-gui_js__updated.window_.html">gui/js/"updated.window"</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_">_</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#fixIdenticalRenamed">fixIdenticalRenamed</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#ignoreDeletedBeforeIdenticalRenamed">ignoreDeletedBeforeIdenticalRenamed</a></li><li><a href="global.html#indexDeletedEvent">indexDeletedEvent</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#Promise">Promise</a></li><li><a href="global.html#rotateState">rotateState</a></li><li><a href="global.html#step">step</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

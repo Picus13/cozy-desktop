@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/ignore.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/ignore.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/** Ignored files/directories handling.
+ *
+ * Cozy-desktop can ignore some files and folders from a list of patterns in the
+ * cozyignore file. This class can be used to know if a file/folder is ignored.
+ *
+ *
+ * @module core/ignore
+ * @see https://git-scm.com/docs/gitignore/#_pattern_format
+ * @flow
+ */
+
+const { basename, dirname, resolve } = require('path')
+const { matcher, makeRe } = require('micromatch')
+const fs = require('fs')
+
+const logger = require('./utils/logger')
+
+const log = logger({
+  component: 'Ignore'
+})
+
+/*::
+export type IgnorePattern = {
+  match: (string) => boolean,
+  basename: boolean,
+  folder: boolean,
+  negate: boolean
+}
+*/
+
+/** Load both given file rules &amp; default ones */
+function loadSync(rulesFilePath /*: string */) /*: Ignore */ {
+  let ignored
+  try {
+    ignored = readLinesSync(rulesFilePath)
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      log.info(
+        { rulesFilePath },
+        'Skip loading of non-existent ignore rules file'
+      )
+    } else {
+      log.warn({ rulesFilePath, err }, 'Failed loading ignore rules file')
+    }
+    ignored = []
+  }
+  return new Ignore(ignored).addDefaultRules()
+}
+
+/** Read lines from a file.
+ */
+function readLinesSync(filePath /*: string */) /*: string[] */ {
+  return fs.readFileSync(filePath, 'utf8').split(/\r?\n/)
+}
+
+// Parse a line and build the corresponding pattern
+function buildPattern(line /*: string */) /*: IgnorePattern */ {
+  let folder = false
+  let negate = false
+  let noslash = line.indexOf('/') === -1
+  if (line.indexOf('**') !== -1) {
+    // Detect two asterisks
+    noslash = false
+  }
+  if (line[0] === '!') {
+    // Detect bang prefix
+    line = line.slice(1)
+    negate = true
+  }
+  if (line[0] === '/') {
+    // Detect leading slash
+    line = line.slice(1)
+  }
+  if (line[line.length - 1] === '/') {
+    // Detect trailing slash
+    line = line.slice(0, line.length - 1)
+    folder = true
+  }
+  line = line.replace(/^\\/, '') // Remove leading escaping char
+  line = line.replace(/( |\t)*$/, '') // Remove trailing spaces
+  // Ignore case for case insensitive file-systems
+  if (process.platform === 'darwin' || process.platform === 'win32') {
+    line = makeRe(line, { nocase: true })
+  }
+  let pattern = {
+    match: matcher(line, {}),
+    basename: noslash, // The pattern can match only the basename
+    folder, // The pattern will only match a folder
+    negate // The pattern is negated
+  }
+  return pattern
+}
+
+/** Parse many lines and build the corresponding pattern array */
+function buildPatternArray(lines /*: string[] */) /*: IgnorePattern[] */ {
+  return Array.from(lines)
+    .filter(isNotBlankOrComment)
+    .map(buildPattern)
+}
+
+function isNotBlankOrComment(line /*: string */) /*: boolean */ {
+  return line !== '' &amp;&amp; line[0] !== '#'
+}
+
+function match(
+  path /*: string */,
+  isFolder /*: boolean */,
+  pattern /*: IgnorePattern */
+) /*: boolean */ {
+  if (pattern.basename) {
+    if (pattern.match(basename(path))) {
+      return true
+    }
+  }
+  if (isFolder || !pattern.folder) {
+    if (pattern.match(path)) {
+      return true
+    }
+  }
+  let parent = dirname(path)
+  if (parent === '.') {
+    return false
+  }
+  // On Windows, the various `path.*()` functions don't play well with
+  // relative paths where the top-level file or directory name includes a
+  // forbidden `:` character and looks like a drive letter, even without a
+  // separator. Better make sure we don't end up in an infinite loop.
+  if (parent === path) {
+    return false
+  }
+  return match(parent, true, pattern)
+}
+
+/** The default rules included in the repo */
+const defaultRulesPath = resolve(__dirname, './config/.cozyignore')
+
+class Ignore {
+  /*::
+  patterns: IgnorePattern[]
+  */
+
+  // Load patterns for detecting ignored files and folders
+  constructor(lines /*: string[] */) {
+    this.patterns = buildPatternArray(lines)
+  }
+
+  // Add some rules for things that should be always ignored (temporary
+  // files, thumbnails db, trash, etc.)
+  addDefaultRules() /*: this */ {
+    const defaultPatterns = buildPatternArray(readLinesSync(defaultRulesPath))
+    this.patterns = defaultPatterns.concat(this.patterns)
+    return this
+  }
+
+  // Return true if the given file/folder path should be ignored
+  isIgnored(
+    { relativePath, isFolder } /*: {relativePath: string, isFolder: boolean} */
+  ) /*: boolean */ {
+    let result = false
+    for (let pattern of Array.from(this.patterns)) {
+      if (pattern.negate) {
+        if (result) {
+          result = !match(relativePath, isFolder, pattern)
+        }
+      } else {
+        if (!result) {
+          result = match(relativePath, isFolder, pattern)
+        }
+      }
+    }
+    return result
+  }
+}
+
+module.exports = {
+  Ignore,
+  loadSync
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js__help.window_.html">gui/js/"help.window"</a></li><li><a href="module-gui_js__onboarding.window_.html">gui/js/"onboarding.window"</a></li><li><a href="module-gui_js__tray.window_.html">gui/js/"tray.window"</a></li><li><a href="module-gui_js__updated.window_.html">gui/js/"updated.window"</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_">_</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#fixIdenticalRenamed">fixIdenticalRenamed</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#ignoreDeletedBeforeIdenticalRenamed">ignoreDeletedBeforeIdenticalRenamed</a></li><li><a href="global.html#indexDeletedEvent">indexDeletedEvent</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#Promise">Promise</a></li><li><a href="global.html#rotateState">rotateState</a></li><li><a href="global.html#step">step</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

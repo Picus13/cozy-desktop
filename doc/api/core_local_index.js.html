@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/local/index.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/local/index.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/** The Local side read/write interface.
+ *
+ * @module core/local
+ * @flow
+ */
+
+const async = require('async')
+const autoBind = require('auto-bind')
+const fse = require('fs-extra')
+const path = require('path')
+const trash = require('trash')
+
+const bluebird = require('bluebird')
+
+const { TMP_DIR_NAME } = require('./constants')
+const stater = require('./stater')
+const { isUpToDate } = require('../metadata')
+const { hideOnWindows } = require('../utils/fs')
+const watcher = require('./watcher')
+const { withContentLength } = require('../file_stream_provider')
+const syncDir = require('./sync_dir')
+const logger = require('../utils/logger')
+const measureTime = require('../utils/perfs')
+const sentry = require('../utils/sentry')
+
+/*::
+import type EventEmitter from 'events'
+import type { Config } from '../config'
+import type { FileStreamProvider, ReadableWithContentLength } from '../file_stream_provider'
+import type { Ignore } from '../ignore'
+import type { AtomEventsDispatcher } from './atom/dispatch'
+import type { Metadata } from '../metadata'
+import type Pouch from '../pouch'
+import type Prep from '../prep'
+import type { Side } from '../side' // eslint-disable-line
+import type { Callback } from '../utils/func'
+import type { Watcher } from './watcher'
+*/
+
+const log = logger({
+  component: 'LocalWriter'
+})
+
+/*::
+export type LocalOptions = {
+  config: Config,
+  onAtomEvents?: AtomEventsDispatcher,
+  prep: Prep,
+  pouch: Pouch,
+  events: EventEmitter,
+  ignore: Ignore
+}
+*/
+
+// Local is the class that interfaces cozy-desktop with the local filesystem.
+// It uses a watcher, based on chokidar, to listen for file and folder changes.
+// It also applied changes from the remote cozy on the local filesystem.
+module.exports = class Local /*:: implements Side */ {
+  /*::
+  prep: Prep
+  pouch: Pouch
+  events: EventEmitter
+  syncPath: string
+  syncDirCheckInterval: IntervalID
+  tmpPath: string
+  watcher: Watcher
+  other: FileStreamProvider
+  _trash: (Array&lt;string>) => Promise&lt;void>
+  */
+
+  constructor(opts /*: LocalOptions */) {
+    this.prep = opts.prep
+    this.pouch = opts.pouch
+    this.events = opts.events
+    this.syncPath = opts.config.syncPath
+    this.tmpPath = path.join(this.syncPath, TMP_DIR_NAME)
+    this.watcher = watcher.build(opts)
+    // $FlowFixMe
+    this.other = null
+    this._trash = trash
+
+    autoBind(this)
+    bluebird.promisifyAll(this)
+  }
+
+  /*::
+  addFileAsync: (Metadata) => Promise&lt;*>
+  addFolderAsync: (Metadata) => Promise&lt;*>
+  updateFileMetadataAsync: (Metadata, Metadata) => Promise&lt;*>
+  renameConflictingDocAsync: (doc: Metadata, newPath: string) => Promise&lt;void>
+  */
+
+  // Start initial replication + watching changes in live
+  start() {
+    syncDir.ensureExistsSync(this)
+    this.syncDirCheckInterval = syncDir.startIntervalCheck(this)
+    return this.watcher.start()
+  }
+
+  // Stop watching the file system
+  stop() {
+    clearInterval(this.syncDirCheckInterval)
+    return this.watcher.stop()
+  }
+
+  // Create a readable stream for the given doc
+  // adds a contentLength property to be used
+  async createReadStreamAsync(
+    doc /*: Metadata */
+  ) /*: Promise&lt;ReadableWithContentLength> */ {
+    try {
+      let filePath = path.resolve(this.syncPath, doc.path)
+      let pStats = fse.stat(filePath)
+      let pStream = new Promise((resolve, reject) => {
+        let stream = fse.createReadStream(filePath)
+        stream.on('open', () => resolve(stream))
+        stream.on('error', err => reject(err))
+      })
+      const [
+        stream /*: ReadableWithContentLength */,
+        stat /*: fs.Stat */
+      ] = await Promise.all([pStream, pStats])
+      return withContentLength(stream, stat.size)
+    } catch (err) {
+      return Promise.reject(err)
+    }
+  }
+
+  /* Helpers */
+
+  // Return a function that will update last modification date
+  // and does a chmod +x if the file is executable
+  //
+  // Note: UNIX has 3 timestamps for a file/folder:
+  // - atime for last access
+  // - ctime for change (metadata or content)
+  // - utime for update (content only)
+  // This function updates utime and ctime according to the last
+  // modification date.
+  metadataUpdater(doc /*: Metadata */) {
+    return (callback /*: Callback */) => {
+      this.updateMetadataAsync(doc)
+        .then(() => {
+          callback()
+        })
+        .catch(callback)
+    }
+  }
+
+  async updateMetadataAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    let filePath = path.resolve(this.syncPath, doc.path)
+
+    if (doc.docType === 'file') {
+      // TODO: Honor existing read/write permissions
+      await fse.chmod(filePath, doc.executable ? 0o755 : 0o644)
+    }
+
+    if (doc.updated_at) {
+      let updated = new Date(doc.updated_at)
+      try {
+        await fse.utimes(filePath, updated, updated)
+      } catch (_) {
+        // Ignore errors
+      }
+    }
+  }
+
+  inodeSetter(doc /*: Metadata */) {
+    let abspath = path.resolve(this.syncPath, doc.path)
+    return (callback /*: Callback */) => {
+      stater.withStats(abspath, (err, stats) => {
+        if (err) {
+          callback(err)
+        } else {
+          stater.assignInoAndFileId(doc, stats)
+          callback(null)
+        }
+      })
+    }
+  }
+
+  // Check if a file corresponding to given checksum already exists
+  fileExistsLocally(checksum /*: string */, callback /*: Callback */) {
+    this.pouch.byChecksum(checksum, (err, docs) => {
+      if (err) {
+        callback(err)
+      } else if (docs == null || docs.length === 0) {
+        callback(null, false)
+      } else {
+        let paths = Array.from(docs)
+          .filter(doc => isUpToDate('local', doc))
+          .map(doc => path.resolve(this.syncPath, doc.path))
+        async.detect(
+          paths,
+          (filePath, next) => fse.exists(filePath, found => next(null, found)),
+          callback
+        )
+      }
+    })
+  }
+
+  /* Write operations */
+
+  // Add a new file, or replace an existing one
+  //
+  // Steps to create a file:
+  //   * Try to find a similar file based on his checksum
+  //     (in that case, it just requires a local copy)
+  //   * Or download the linked binary from remote
+  //   * Write to a temporary file
+  //   * Ensure parent folder exists
+  //   * Move the temporay file to its final destination
+  //   * Update creation and last modification dates
+  //
+  // Note: if no checksum was available for this file, we download the file
+  // from the remote document. Later, chokidar will fire an event for this new
+  // file. The checksum will then be computed and added to the document, and
+  // then pushed to CouchDB.
+  addFile(doc /*: Metadata */, callback /*: Callback */) /*: void */ {
+    let tmpFile = path.resolve(this.tmpPath, `${path.basename(doc.path)}.tmp`)
+    let filePath = path.resolve(this.syncPath, doc.path)
+    let parent = path.resolve(this.syncPath, path.dirname(doc.path))
+    const stopMeasure = measureTime('LocalWriter#addFile')
+
+    log.info({ path: doc.path }, 'Put file')
+
+    async.waterfall(
+      [
+        next => {
+          if (doc.md5sum != null) {
+            this.fileExistsLocally(doc.md5sum, next)
+          } else {
+            next(null, false)
+          }
+        },
+
+        (existingFilePath, next) => {
+          fse.ensureDir(this.tmpPath, () => {
+            hideOnWindows(this.tmpPath)
+            if (existingFilePath) {
+              log.info(
+                { path: filePath },
+                `Recopy ${existingFilePath} -> ${filePath}`
+              )
+              this.events.emit('transfer-copy', doc)
+              fse.copy(existingFilePath, tmpFile, next)
+            } else {
+              this.other.createReadStreamAsync(doc).then(
+                stream => {
+                  // Don't use async callback here!
+                  // Async does some magic and the stream can throw an
+                  // 'error' event before the next async is called...
+                  let target = fse.createWriteStream(tmpFile)
+                  stream.pipe(target)
+                  target.on('finish', next)
+                  target.on('error', next)
+                },
+                err => {
+                  next(err)
+                }
+              )
+            }
+          })
+        },
+
+        next => {
+          if (doc.md5sum != null) {
+            // TODO: Share checksumer instead of chaining properties
+            this.watcher.checksumer
+              .push(tmpFile)
+              .asCallback(function(err, md5sum) {
+                if (err) {
+                  next(err)
+                } else if (md5sum === doc.md5sum) {
+                  next()
+                } else {
+                  next(new Error('Invalid checksum'))
+                }
+              })
+          } else {
+            next()
+          }
+        },
+
+        next => {
+          // After downloading a file, check that the size is correct too
+          // (more protection against stack corruption)
+          stater.withStats(tmpFile, (err, stats) => {
+            if (err) {
+              next(err)
+            } else if (!doc.size || doc.size === stats.size) {
+              stater.assignInoAndFileId(doc, stats)
+              next()
+            } else {
+              next(sentry.flag(new Error('Invalid size')))
+            }
+          })
+        },
+
+        next =>
+          fse.ensureDir(parent, () => fse.rename(tmpFile, filePath, next)),
+
+        this.metadataUpdater(doc)
+      ],
+      function(err) {
+        stopMeasure()
+        if (err) {
+          log.warn({ path: doc.path }, 'addFile failed:', err, doc)
+        }
+        fse.unlink(tmpFile, () => callback(err))
+      }
+    )
+  }
+
+  // Create a new folder
+  addFolder(doc /*: Metadata */, callback /*: Callback */) /*: void */ {
+    let folderPath = path.join(this.syncPath, doc.path)
+    log.info({ path: doc.path }, 'Put folder')
+    async.series(
+      [
+        cb => fse.ensureDir(folderPath, cb),
+        this.inodeSetter(doc),
+        this.metadataUpdater(doc)
+      ],
+      callback
+    )
+  }
+
+  // Overwrite a file
+  async overwriteFileAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    await this.addFileAsync(doc)
+  }
+
+  // Update the metadata of a file
+  updateFileMetadata(
+    doc /*: Metadata */,
+    old /*: Metadata */,
+    callback /*: Callback */
+  ) /*: void */ {
+    log.info({ path: doc.path }, 'Updating file metadata...')
+    this.metadataUpdater(doc)(callback)
+  }
+
+  // Update a folder
+  async updateFolderAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    await this.addFolderAsync(doc)
+  }
+
+  async assignNewRev(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    log.info({ path: doc.path }, 'Local assignNewRev = noop')
+  }
+
+  /** Move a file, eventually updating its content */
+  async moveFileAsync(
+    doc /*: Metadata */,
+    old /*: Metadata */
+  ) /*: Promise&lt;void> */ {
+    log.info({ path: doc.path, oldpath: old.path }, 'Moving file')
+    await this._move(doc, old)
+  }
+
+  /** Move a folder */
+  async moveFolderAsync(
+    doc /*: Metadata */,
+    old /*: Metadata */
+  ) /*: Promise&lt;void> */ {
+    log.info({ path: doc.path, oldpath: old.path }, 'Moving folder')
+    await this._move(doc, old)
+  }
+
+  /** Move a file or folder. In case of a file, content is unchanged.
+   *
+   * On GNU/Linux, it should be possible to prevent overwriting the destination
+   * using the `RENAME_NOREPLACE` flag:
+   * http://man7.org/linux/man-pages/man2/rename.2.html
+   *
+   * But since Node's `fs.rename()` doesn't expose any option, the current
+   * implementation uses a separate `fs.stat()` step, which means it doesn't
+   * prevent race conditions:
+   * https://nodejs.org/dist/latest-v8.x/docs/api/fs.html#fs_fs_rename_oldpath_newpath_callback
+   * https://nodejs.org/dist/latest-v8.x/docs/api/fs.html#fs_fs_stat_path_callback
+   *
+   * TODO: atomic local destination check + move
+   */
+  async _move(doc /*: Metadata */, old /*: Metadata */) /*: Promise&lt;void> */ {
+    let oldPath = path.join(this.syncPath, old.path)
+    let newPath = path.join(this.syncPath, doc.path)
+
+    if (doc._id !== old._id) {
+      try {
+        const stats = await fse.stat(newPath)
+        const err = new Error(`Move destination already exists: ${newPath}`)
+        // Assign stats to the Error so we can inspect them in logs
+        // $FlowFixMe
+        err.stats = stats
+        throw err
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err
+      }
+    }
+
+    await fse.rename(oldPath, newPath)
+    await this.updateMetadataAsync(doc)
+  }
+
+  async trashAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    log.info({ path: doc.path }, 'Moving to the OS trash...')
+    this.events.emit('delete-file', doc)
+    let fullpath = path.join(this.syncPath, doc.path)
+    try {
+      await this._trash([fullpath])
+    } catch (err) {
+      throw err
+    }
+  }
+
+  async deleteFolderAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    if (doc.docType !== 'folder')
+      throw new Error(`Not folder metadata: ${doc.path}`)
+    const fullpath = path.join(this.syncPath, doc.path)
+
+    try {
+      log.info({ path: doc.path }, 'Deleting empty folder...')
+      await fse.rmdir(fullpath)
+      this.events.emit('delete-file', doc)
+      return
+    } catch (err) {
+      if (err.code !== 'ENOTEMPTY') throw err
+    }
+    log.warn({ path: doc.path }, 'Folder is not empty!')
+    await this.trashAsync(doc)
+  }
+
+  // Rename a file/folder to resolve a conflict
+  renameConflictingDoc(
+    doc /*: Metadata */,
+    newPath /*: string */,
+    callback /*: Callback */
+  ) {
+    log.info({ path: doc.path }, `Resolve a conflict: ${doc.path} → ${newPath}`)
+    let srcPath = path.join(this.syncPath, doc.path)
+    let dstPath = path.join(this.syncPath, newPath)
+    fse.rename(srcPath, dstPath, callback)
+    // TODO: Don't fire an event for the deleted file?
+  }
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js__help.window_.html">gui/js/"help.window"</a></li><li><a href="module-gui_js__onboarding.window_.html">gui/js/"onboarding.window"</a></li><li><a href="module-gui_js__tray.window_.html">gui/js/"tray.window"</a></li><li><a href="module-gui_js__updated.window_.html">gui/js/"updated.window"</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_">_</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#fixIdenticalRenamed">fixIdenticalRenamed</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#ignoreDeletedBeforeIdenticalRenamed">ignoreDeletedBeforeIdenticalRenamed</a></li><li><a href="global.html#indexDeletedEvent">indexDeletedEvent</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#Promise">Promise</a></li><li><a href="global.html#rotateState">rotateState</a></li><li><a href="global.html#step">step</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

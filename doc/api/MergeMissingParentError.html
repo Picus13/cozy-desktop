@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Class: MergeMissingParentError</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Class: MergeMissingParentError</h1>
+
+    
+
+
+
+
+<section>
+
+<header>
+    
+        <h2><span class="attribs"><span class="type-signature"></span></span>MergeMissingParentError<span class="signature">()</span><span class="type-signature"></span></h2>
+        
+            <div class="class-description"><p>Error occuring when parent of doc being merged is missing from Pouch.</p>
+<p>For now, this error only occurs when merging remote changes.</p>
+<p>In case the parent is missing, the made-up document would be inconsistent,
+with <code>sides.remote</code> set but no <code>remote._id</code> nor <code>remote._rev</code>. Any
+subsequent subsequent local change could fail because of those missing.</p>
+<p>Regarding local changes, one could wonder whether we should adopt the same
+behavior: made-up documents will be missing an inode. Which could result in
+subsequent moves not being detected correctly. But at least it should not
+prevent subsequent remote changes from being synced since the inode is not
+used in this case.</p>
+<p>This error is mostly caused by a bug, either in a previous Merge/Sync run
+or related to some watcher events order.</p></div>
+        
+    
+</header>
+
+<article>
+    <div class="container-overview">
+    
+        
+
+    
+    <h2>Constructor</h2>
+    
+
+    
+    <h4 class="name" id="MergeMissingParentError"><span class="type-signature"></span>new MergeMissingParentError<span class="signature">()</span><span class="type-signature"></span></h4>
+    
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<dl class="details">
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+    <dt class="tag-source">Source:</dt>
+    <dd class="tag-source"><ul class="dummy"><li>
+        <a href="core_merge.js.html">core/merge.js</a>, <a href="core_merge.js.html#line44">line 44</a>
+    </li></ul></dd>
+    
+
+    
+
+    
+
+    
+</dl>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+    </div>
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+</article>
+
+</section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_win_identical_renaming.html">core/local/atom/win_identical_renaming</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_sync.html">core/sync</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module.exports.html">exports</a></li><li><a href="module-core_app-App.html">App</a></li><li><a href="module-core_config-Config.html">Config</a></li><li><a href="module-core_local-Local.html">Local</a></li><li><a href="module-core_sync-Sync.html">Sync</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_getAuthorizationForm">_getAuthorizationForm</a></li><li><a href="global.html#_getCsrfToken">_getCsrfToken</a></li><li><a href="global.html#authorize">authorize</a></li><li><a href="global.html#automatedRegistration">automatedRegistration</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#login">login</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#only">only</a></li><li><a href="global.html#producer">producer</a></li><li><a href="global.html#steps">steps</a></li><li><a href="global.html#UPDATE_CHECK_TIMEOUT">UPDATE_CHECK_TIMEOUT</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

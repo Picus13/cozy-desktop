@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/sync.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/sync.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * @module core/sync
+ * @flow
+ */
+
+const autoBind = require('auto-bind')
+const Promise = require('bluebird')
+
+const { dirname } = require('path')
+const _ = require('lodash')
+
+const metadata = require('./metadata')
+const { handleCommonCozyErrors } = require('./remote/cozy')
+const { HEARTBEAT } = require('./remote/watcher')
+const { otherSide } = require('./side')
+const logger = require('./utils/logger')
+const measureTime = require('./utils/perfs')
+
+/*::
+import type EventEmitter from 'events'
+import type { Ignore } from './ignore'
+import type Local from './local'
+import type Pouch from './pouch'
+import type { Remote } from './remote'
+import type { SideName, Metadata } from './metadata'
+import type { Side } from './side' // eslint-disable-line
+*/
+
+const log = logger({
+  component: 'Sync'
+})
+
+const MAX_SYNC_ATTEMPTS = 3
+
+const TRASHING_DELAY = 1000
+
+/*::
+type MetadataChange = {
+  changes: {rev: string}[],
+  doc: Metadata,
+  id: string,
+  seq: number
+};
+
+export type SyncMode =
+  | "pull"
+  | "push"
+  | "full";
+*/
+
+// Sync listens to PouchDB about the metadata changes, and calls local and
+// remote sides to apply the changes on the filesystem and remote CouchDB
+// respectively.
+class Sync {
+  /*::
+  changes: any
+  events: EventEmitter
+  ignore: Ignore
+  local: Local
+  pouch: Pouch
+  remote: Remote
+  stopped: ?boolean
+  moveTo: ?string
+
+  diskUsage: () => Promise&lt;*>
+  */
+
+  // FIXME: static TRASHING_DELAY = TRASHING_DELAY
+
+  constructor(
+    pouch /*: Pouch */,
+    local /*: Local */,
+    remote /*: Remote */,
+    ignore /*: Ignore */,
+    events /*: EventEmitter */
+  ) {
+    this.pouch = pouch
+    this.local = local
+    this.remote = remote
+    this.ignore = ignore
+    this.events = events
+    // $FlowFixMe
+    this.local.other = this.remote
+    // $FlowFixMe
+    this.remote.other = this.local
+
+    autoBind(this)
+  }
+
+  // Start to synchronize the remote cozy with the local filesystem
+  // First, start metadata synchronization in pouch, with the watchers
+  // Then, when a stable state is reached, start applying changes from pouch
+  //
+  // The mode can be:
+  // - pull if only changes from the remote cozy are applied to the fs
+  // - push if only changes from the fs are applied to the remote cozy
+  // - full for the full synchronization of the both sides
+  async start(mode /*: SyncMode */) /*: Promise&lt;*> */ {
+    this.stopped = false
+    await this.pouch.addAllViewsAsync()
+    let sidePromises = []
+    if (mode !== 'pull') {
+      await this.local.start()
+      sidePromises.push(this.local.watcher.running)
+    }
+    if (mode !== 'push') {
+      const { running, started } = this.remote.start()
+      sidePromises.push(running)
+      await started
+    }
+    await new Promise(
+      async function(resolve, reject) {
+        Promise.all(sidePromises).catch(err => reject(err))
+        try {
+          // eslint-disable-next-line no-constant-condition
+          while (true) {
+            await this.sync()
+          }
+        } catch (err) {
+          reject(err)
+        }
+      }.bind(this)
+    ).catch(err => {
+      this.stop()
+      throw err
+    })
+  }
+
+  // Stop the synchronization
+  stop() {
+    this.stopped = true
+    if (this.changes) {
+      this.changes.cancel()
+      this.changes = null
+    }
+    return Promise.all([this.local.stop(), this.remote.stop()])
+  }
+
+  // TODO: remove waitForNewChanges to .start while(true)
+  async sync(waitForNewChanges /*: boolean */ = true) /*: Promise&lt;*> */ {
+    let seq = await this.pouch.getLocalSeqAsync()
+    log.trace({ seq }, 'Waiting for changes since seq')
+    if (waitForNewChanges) await this.waitForNewChanges(seq)
+    this.events.emit('sync-start')
+    const release = await this.pouch.lock(this)
+    try {
+      await this.syncBatch()
+    } finally {
+      release()
+      this.events.emit('sync-end')
+    }
+    log.debug('No more metadata changes for now')
+  }
+
+  // sync
+  async syncBatch() {
+    let seq = null
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (this.stopped) break
+      seq = await this.pouch.getLocalSeqAsync()
+      // TODO: Prevent infinite loop
+      let change = await this.getNextChange(seq)
+      if (change == null) break
+      this.events.emit('sync-current', change.seq)
+      try {
+        await this.apply(change)
+        // XXX: apply should call setLocalSeqAsync
+      } catch (err) {
+        if (!this.stopped) throw err
+      }
+    }
+  }
+
+  // We filter with the byPath view to reject design documents
+  //
+  // Note: it is difficult to pick only one change at a time because pouch can
+  // emit several docs in a row, and `limit: 1` seems to be not effective!
+  async baseChangeOptions(seq /*: number */) /*: Object */ {
+    return {
+      limit: 1,
+      since: seq,
+      filter: '_view',
+      view: 'byPath',
+      returnDocs: false
+    }
+  }
+
+  async waitForNewChanges(seq /*: number */) {
+    const opts = await this.baseChangeOptions(seq)
+    opts.live = true
+    return new Promise((resolve, reject) => {
+      this.changes = this.pouch.db
+        .changes(opts)
+        .on('change', () => {
+          if (this.changes) {
+            this.changes.cancel()
+            this.changes = null
+            resolve()
+          }
+        })
+        .on('error', err => {
+          if (this.changes) {
+            // FIXME: pas de cancel ici ??
+            this.changes = null
+            reject(err)
+          }
+        })
+    })
+  }
+
+  async getNextChange(seq /*: number */) /*: Promise&lt;?MetadataChange> */ {
+    const stopMeasure = measureTime('Sync#getNextChange')
+    const opts = await this.baseChangeOptions(seq)
+    opts.include_docs = true
+    const p = new Promise((resolve, reject) => {
+      this.pouch.db
+        .changes(opts)
+        .on('change', info => resolve(info))
+        .on('error', err => reject(err))
+        .on('complete', info => {
+          if (info.results == null || info.results.length === 0) {
+            resolve(null)
+          }
+        })
+    })
+    stopMeasure()
+    return p
+  }
+
+  // Apply a change to both local and remote
+  // At least one side should say it has already this change
+  // In some cases, both sides have the change
+  async apply(change /*: MetadataChange */) /*: Promise&lt;*> */ {
+    let { doc, seq } = change
+    const { path } = doc
+    log.debug({ path, seq, doc }, 'Applying change...')
+
+    if (metadata.shouldIgnore(doc, this.ignore)) {
+      return this.pouch.setLocalSeqAsync(change.seq)
+    }
+
+    // FIXME: Acquire lock for as many changes as possible to prevent next huge
+    // remote/local batches to acquite it first
+    let stopMeasure = () => {}
+    let [side, sideName, rev] = this.selectSide(doc)
+    try {
+      stopMeasure = measureTime('Sync#applyChange:' + sideName)
+
+      if (!side) {
+        log.info({ path }, 'up to date')
+        return this.pouch.setLocalSeqAsync(change.seq)
+      } else if (sideName === 'remote' &amp;&amp; doc.trashed) {
+        // File or folder was just deleted locally
+        const byItself = await this.trashWithParentOrByItself(doc, side)
+        if (!byItself) {
+          return
+        }
+      } else {
+        await this.applyDoc(doc, side, sideName, rev)
+        delete doc.moveFrom
+      }
+
+      log.trace({ path, seq }, `Applied change on ${sideName} side`)
+      await this.pouch.setLocalSeqAsync(change.seq)
+      if (!change.doc._deleted) {
+        await this.updateRevs(change.doc, sideName)
+      }
+    } catch (err) {
+      await this.handleApplyError(change, sideName, err)
+    } finally {
+      stopMeasure()
+    }
+  }
+
+  async applyDoc(
+    doc /*: Metadata */,
+    side /*: Side */,
+    sideName /*: SideName */,
+    rev /*: number */
+  ) /*: Promise&lt;*> */ {
+    if (doc.incompatibilities &amp;&amp; sideName === 'local' &amp;&amp; doc.moveTo == null) {
+      const was = doc.moveFrom
+      if (was != null &amp;&amp; was.incompatibilities == null) {
+        // Move compatible -> incompatible
+        if (was.childMove == null) {
+          log.warn(
+            {
+              path: doc.path,
+              oldpath: was.path,
+              incompatibilities: doc.incompatibilities
+            },
+            `Trashing ${sideName} ${
+              doc.docType
+            } since new remote one is incompatible`
+          )
+          await side.trashAsync(was)
+        } else {
+          log.debug(
+            { path: doc.path, incompatibilities: doc.incompatibilities },
+            `incompatible ${doc.docType} should have been trashed with parent`
+          )
+        }
+      } else {
+        log.warn(
+          { path: doc.path, incompatibilities: doc.incompatibilities },
+          `Not syncing incompatible ${doc.docType}`
+        )
+      }
+    } else if (doc.docType !== 'file' &amp;&amp; doc.docType !== 'folder') {
+      throw new Error(`Unknown docType: ${doc.docType}`)
+    } else if (doc._deleted &amp;&amp; rev === 0) {
+      // do nothing
+    } else if (doc.moveTo != null) {
+      log.debug(
+        { path: doc.path },
+        `Ignoring deleted ${doc.docType} metadata as move source`
+      )
+    } else if (doc.moveFrom != null) {
+      const from = (doc.moveFrom /*: Metadata */)
+      log.debug(
+        { path: doc.path },
+        `Applying ${doc.docType} change with moveFrom`
+      )
+
+      if (from.incompatibilities) {
+        await this.doAdd(side, doc)
+      } else if (from.childMove) {
+        await side.assignNewRev(doc)
+        this.events.emit('transfer-move', _.clone(doc), _.clone(from))
+      } else {
+        if (from.moveFrom &amp;&amp; from.moveFrom.childMove) {
+          await side.assignNewRev(from)
+        }
+        await this.doMove(side, doc, from)
+      }
+      delete doc.moveFrom // the move succeeded, delete moveFrom before attempting overwrite
+      if (!metadata.sameBinary(from, doc)) {
+        await side.overwriteFileAsync(doc, doc) // move &amp; update
+      }
+    } else if (doc._deleted) {
+      log.debug({ path: doc.path }, `Applying ${doc.docType} deletion`)
+      if (doc.docType === 'file') await side.trashAsync(doc)
+      else await side.deleteFolderAsync(doc)
+    } else if (rev === 0) {
+      log.debug({ path: doc.path }, `Applying ${doc.docType} addition`)
+      await this.doAdd(side, doc)
+    } else {
+      log.debug({ path: doc.path }, `Applying else for ${doc.docType} change`)
+      let old
+      try {
+        old = await this.pouch.getPreviousRevAsync(doc._id, rev)
+      } catch (_) {
+        await this.doOverwrite(side, doc)
+      }
+
+      if (old) {
+        if (doc.docType === 'folder') {
+          await side.updateFolderAsync(doc, old)
+          // $FlowFixMe
+        } else if (metadata.sameBinary(old, doc)) {
+          if (metadata.sameFileIgnoreRev(old, doc)) {
+            log.debug({ path: doc.path }, 'Ignoring timestamp-only change')
+          } else {
+            await side.updateFileMetadataAsync(doc, old)
+          }
+        } else {
+          await side.overwriteFileAsync(doc, old)
+          this.events.emit('transfer-started', _.clone(doc))
+        }
+      } // TODO else what do we do ?
+    }
+  }
+
+  async doAdd(side /*: Side */, doc /*: Metadata */) /*: Promise&lt;void> */ {
+    if (doc.docType === 'file') {
+      await side.addFileAsync(doc)
+      this.events.emit('transfer-started', _.clone(doc))
+    } else {
+      await side.addFolderAsync(doc)
+    }
+  }
+
+  async doOverwrite(
+    side /*: Side */,
+    doc /*: Metadata */
+  ) /*: Promise&lt;void> */ {
+    if (doc.docType === 'file') {
+      // TODO: risky overwrite without If-Match
+      await side.overwriteFileAsync(doc, null)
+      this.events.emit('transfer-started', _.clone(doc))
+    } else {
+      await side.addFolderAsync(doc)
+    }
+  }
+
+  async doMove(
+    side /*: Side */,
+    doc /*: Metadata */,
+    old /*: Metadata */
+  ) /*: Promise&lt;void> */ {
+    if (doc.overwrite) await this.trashWithParentOrByItself(doc.overwrite, side)
+    if (doc.docType === 'file') {
+      await side.moveFileAsync(doc, old)
+      this.events.emit('transfer-move', _.clone(doc), _.clone(old))
+    } else await side.moveFolderAsync(doc, old)
+  }
+
+  // Select which side will apply the change
+  // It returns the side, its name, and also the last rev applied by this side
+  selectSide(doc /*: Metadata */) {
+    switch (metadata.outOfDateSide(doc)) {
+      case 'local':
+        return [this.local, 'local', doc.sides.local || 0]
+      case 'remote':
+        return [this.remote, 'remote', doc.sides.remote || 0]
+      default:
+        return []
+    }
+  }
+
+  // Make the error explicit (offline, local disk full, quota exceeded, etc.)
+  // and keep track of the number of retries
+  async handleApplyError(
+    change /*: MetadataChange */,
+    sideName /*: SideName */,
+    err /*: * */
+  ) {
+    const { path } = change.doc
+    log.error({ path, err, change })
+    if (err.code === 'ENOSPC') {
+      throw new Error('No more disk space')
+    } else if (err.status === 412) {
+      log.warn({ path }, 'Sync error 412 needs Merge')
+      change.doc.errors = MAX_SYNC_ATTEMPTS
+      return this.updateErrors(change, sideName)
+    } else if (err.status === 413) {
+      throw new Error('Cozy is full')
+    }
+    try {
+      await this.diskUsage()
+    } catch (err) {
+      const result = handleCommonCozyErrors(err, { events: this.events, log })
+      if (result === 'offline') {
+        // The client is offline, wait that it can connect again to the server
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          try {
+            await Promise.delay(60000)
+            await this.diskUsage()
+            this.events.emit('online')
+            log.warn({ path }, 'Client is online')
+            return
+          } catch (err) {
+            // Client is still offline
+          }
+        }
+      }
+    }
+    await this.updateErrors(change, sideName)
+  }
+
+  // Increment the counter of errors for this document
+  async updateErrors(
+    change /*: MetadataChange */,
+    sideName /*: SideName */
+  ) /*: Promise&lt;void> */ {
+    let { doc } = change
+    if (!doc.errors) doc.errors = 0
+    doc.errors++
+
+    // Make sure isUpToDate(sourceSideName, doc) is still true
+    const sourceSideName = otherSide(sideName)
+    metadata.markSide(sourceSideName, doc, doc)
+
+    // Don't try more than MAX_SYNC_ATTEMPTS for the same operation
+    if (doc.errors &amp;&amp; doc.errors >= MAX_SYNC_ATTEMPTS) {
+      log.error(
+        { path: doc.path, oldpath: _.get(change, 'was.path') },
+        `Failed to sync ${MAX_SYNC_ATTEMPTS} times. Giving up.`
+      )
+      await this.pouch.setLocalSeqAsync(change.seq)
+      // FIXME: final doc.errors is not saved which works but may be confusing.
+      return
+    }
+    try {
+      // The sync error may be due to the remote cozy being overloaded.
+      // So, it's better to wait a bit before trying the next operation.
+      // TODO: Wait for some increasing delay before saving errors
+      await this.pouch.db.put(doc)
+    } catch (err) {
+      // If the doc can't be saved, it's because of a new revision.
+      // So, we can skip this revision
+      log.info(`Ignored ${change.seq}`, err)
+      await this.pouch.setLocalSeqAsync(change.seq)
+    }
+  }
+
+  // Update rev numbers for both local and remote sides
+  async updateRevs(
+    doc /*: Metadata */,
+    side /*: SideName */
+  ) /*: Promise&lt;*> */ {
+    metadata.markAsUpToDate(doc)
+    try {
+      await this.pouch.put(doc)
+    } catch (err) {
+      // Conflicts can happen here, for example if the cozy-stack has generated
+      // a thumbnail before apply has finished. In that case, we try to
+      // reconciliate the documents.
+      if (err &amp;&amp; err.status === 409) {
+        const unsynced = await this.pouch.db.get(doc._id)
+        const other = otherSide(side)
+        await this.pouch.put({
+          ...unsynced,
+          sides: {
+            [side]: metadata.extractRevNumber(doc) + 1,
+            [other]: unsynced.sides[other] + 1
+          }
+        })
+      } else {
+        log.warn({ path: doc.path, err }, 'Race condition')
+      }
+    }
+  }
+
+  // Trash a file or folder. If a folder was deleted on local, we try to trash
+  // only this folder on the remote, not every files and folders inside it, to
+  // preserve the tree in the trash.
+  async trashWithParentOrByItself(
+    doc /*: Metadata */,
+    side /*: Side */
+  ) /*: Promise&lt;boolean> */ {
+    let parentId = dirname(doc._id)
+    if (parentId !== '.') {
+      let parent = await this.pouch.db.get(parentId)
+
+      if (!parent.trashed) {
+        await Promise.delay(TRASHING_DELAY)
+        parent = await this.pouch.db.get(parentId)
+      }
+
+      if (parent.trashed &amp;&amp; !metadata.isUpToDate('remote', parent)) {
+        log.info(`${doc.path}: will be trashed with parent directory`)
+        await this.trashWithParentOrByItself(parent, side)
+        // Wait long enough that the remote has fetched one changes feed
+        // TODO find a way to trigger the changes feed instead of waiting for it
+        await Promise.delay(HEARTBEAT)
+        return false
+      }
+    }
+
+    log.info(`${doc.path}: should be trashed by itself`)
+    await side.trashAsync(doc)
+    return true
+  }
+}
+
+module.exports = Sync
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js__help.window_.html">gui/js/"help.window"</a></li><li><a href="module-gui_js__onboarding.window_.html">gui/js/"onboarding.window"</a></li><li><a href="module-gui_js__tray.window_.html">gui/js/"tray.window"</a></li><li><a href="module-gui_js__updated.window_.html">gui/js/"updated.window"</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li></ul><h3>Classes</h3><ul><li><a href="DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#_">_</a></li><li><a href="global.html#disabledScenarioTest">disabledScenarioTest</a></li><li><a href="global.html#fileIdFromNumber">fileIdFromNumber</a></li><li><a href="global.html#fixIdenticalRenamed">fixIdenticalRenamed</a></li><li><a href="global.html#glob">glob</a></li><li><a href="global.html#ignoreDeletedBeforeIdenticalRenamed">ignoreDeletedBeforeIdenticalRenamed</a></li><li><a href="global.html#indexDeletedEvent">indexDeletedEvent</a></li><li><a href="global.html#mergeSideEffects">mergeSideEffects</a></li><li><a href="global.html#Promise">Promise</a></li><li><a href="global.html#rotateState">rotateState</a></li><li><a href="global.html#step">step</a></li><li><a href="global.html#uuid">uuid</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
