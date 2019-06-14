@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/path_restrictions.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/path_restrictions.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * @module core/path_restrictions
+ * @flow
+ */
+
+const path = require('path')
+const { sep } = path
+
+const _ = require('lodash')
+
+/*::
+type SingleCharString = string
+
+type PathRestrictions = {
+  pathMaxBytes: number,
+  nameMaxBytes: number,
+  dirNameMaxBytes: ?number,
+  reservedChars: Set&lt;SingleCharString>,
+  reservedCharsRegExp: RegExp,
+  forbiddenLastChars: Set&lt;SingleCharString>,
+  reservedNames: Set&lt;string>
+}
+
+export type ReservedCharsIssue = {|
+  type: 'reservedChars',
+  name: string,
+  platform: string,
+  reservedChars?: Set&lt;SingleCharString>
+|}
+export type ReservedNameIssue = {|
+  type: 'reservedName',
+  name: string,
+  platform: string,
+  reservedName?: string
+|}
+export type ForbiddenLastCharIssue = {|
+  type: 'forbiddenLastChar',
+  name: string,
+  platform: string,
+  forbiddenLastChar?: SingleCharString
+|}
+export type NameMaxBytesIssue = {|
+  type: 'nameMaxBytes',
+  name: string,
+  platform: string,
+  nameMaxBytes: number
+|}
+export type DirNameMaxBytesIssue = {|
+  type: 'dirNameMaxBytes',
+  name: string,
+  platform: string,
+  dirNameMaxBytes: number
+|}
+
+// Describes a file/dir name issue so one could describe it in a user-friendly
+// way: "File X cannot be saved on platform Y because it contains character Z"
+type NameIssue =
+  | ReservedCharsIssue
+  | ReservedNameIssue
+  | ForbiddenLastCharIssue
+  | NameMaxBytesIssue
+  | DirNameMaxBytesIssue
+
+export type PathLengthIssue = {
+  path: string,
+  pathBytes?: number,
+  pathMaxBytes?: number,
+  platform: string
+}
+
+export type PathIssue =
+  | (NameIssue &amp; {path: string})
+  | PathLengthIssue
+*/
+
+function pathRestrictions(customs /*: Object */) /*: PathRestrictions */ {
+  const reservedChars = customs.reservedChars || new Set()
+  return Object.assign(
+    {
+      dirNameMaxBytes: customs.dirNameMaxBytes || customs.nameMaxBytes,
+      reservedChars,
+      reservedCharsRegExp: new RegExp(
+        '[' +
+          Array.from(reservedChars)
+            .join('')
+            // Escape chars that would be interpreted by the RegExp
+            .replace('\\', '\\\\') +
+          ']',
+        'g'
+      ),
+      forbiddenLastChars: new Set(),
+      reservedNames: new Set()
+    },
+    customs
+  )
+}
+
+// See: https://msdn.microsoft.com/en-us/library/windows/desktop/aa365247(v=vs.85).aspx
+const win = pathRestrictions({
+  pathMaxBytes: 259, // MAX_PATH without nul
+  nameMaxBytes: 256, // pathMaxBytes without drive (ex: 'C:\')
+  dirNameMaxBytes: 243, // nameMaxBytes without an 8.3 filename + separator
+  reservedChars: new Set('&lt;>:"/\\|?*'),
+  forbiddenLastChars: new Set('. '),
+  reservedNames: new Set([
+    'CON',
+    'PRN',
+    'AUX',
+    'NUL',
+    'COM1',
+    'COM2',
+    'COM3',
+    'COM4',
+    'COM5',
+    'COM6',
+    'COM7',
+    'COM8',
+    'COM9',
+    'LPT1',
+    'LPT2',
+    'LPT3',
+    'LPT4',
+    'LPT5',
+    'LPT6',
+    'LPT7',
+    'LPT8',
+    'LPT9'
+  ])
+})
+
+// See: /usr/include/sys/syslimits.h
+const mac = pathRestrictions({
+  pathMaxBytes: 1023, // PATH_MAX without nul
+  nameMaxBytes: 255, // NAME_MAX
+  reservedChars: new Set('/')
+})
+
+// See: /usr/include/linux/limits.h
+const linux = pathRestrictions({
+  pathMaxBytes: 4095, // PATH_MAX without nul
+  nameMaxBytes: 255, // NAME_MAX
+  reservedChars: new Set('/')
+})
+
+module.exports = {
+  win,
+  mac,
+  linux,
+  detectNameIssues,
+  detectPathIssues,
+  detectPathLengthIssue
+}
+
+function restrictionsByPlatform(platform /*: string */) {
+  switch (platform) {
+    case 'win32':
+      return win
+    case 'darwin':
+      return mac
+    case 'linux':
+      return linux
+    default:
+      throw new Error(`Unsupported platform: ${platform}`)
+  }
+}
+
+function detectReservedChars(
+  name /*: string */,
+  restrictions /*: PathRestrictions */
+) /*: ?Array&lt;string> */ {
+  return name.match(restrictions.reservedCharsRegExp)
+}
+
+function detectForbiddenLastChar(
+  name /*: string */,
+  restrictions /*: PathRestrictions */
+) /*: ?string */ {
+  const lastChar = name.slice(-1)
+  if (restrictions.forbiddenLastChars.has(lastChar)) return lastChar
+}
+
+function detectReservedName(
+  name /*: string */,
+  restrictions /*: PathRestrictions */
+) /*: ?string */ {
+  const upperCaseName = name.toUpperCase()
+  const upperCaseBasename = path.basename(
+    upperCaseName,
+    path.extname(upperCaseName)
+  )
+  if (restrictions.reservedNames.has(upperCaseBasename)) {
+    return upperCaseBasename
+  }
+}
+
+function detectNameLengthIssue(
+  name /*: string */,
+  restrictions /*: PathRestrictions */
+) /*: ?number */ {
+  const { nameMaxBytes } = restrictions
+  const nameBytes = Buffer.byteLength(name) // TODO: utf16?
+  if (nameBytes > nameMaxBytes) {
+    return nameMaxBytes
+  }
+}
+
+function detectDirNameLengthIssue(
+  name /*: string */,
+  restrictions /*: PathRestrictions */
+) /*: ?number */ {
+  const { dirNameMaxBytes } = restrictions
+  if (dirNameMaxBytes == null) return detectNameLengthIssue(name, restrictions)
+  // TODO: utf16?
+  if (Buffer.byteLength(name) > dirNameMaxBytes) return dirNameMaxBytes
+}
+
+// Identifies file/dir name issues that will prevent local synchronization
+function detectNameIssues(
+  name /*: string */,
+  type /*: string */,
+  platform /*: string */
+) /*: NameIssue[] */ {
+  const restrictions = restrictionsByPlatform(platform)
+  const issues = []
+
+  const reservedChars = detectReservedChars(name, restrictions)
+  if (reservedChars) {
+    issues.push({
+      type: 'reservedChars',
+      name,
+      platform,
+      reservedChars: new Set(reservedChars)
+    })
+  }
+
+  const reservedName = detectReservedName(name, restrictions)
+  if (reservedName) {
+    issues.push({ type: 'reservedName', name, platform, reservedName })
+  }
+
+  const forbiddenLastChar = detectForbiddenLastChar(name, restrictions)
+  if (forbiddenLastChar) {
+    issues.push({
+      type: 'forbiddenLastChar',
+      name,
+      platform,
+      forbiddenLastChar
+    })
+  }
+
+  if (type === 'folder') {
+    const dirNameMaxBytes = detectDirNameLengthIssue(name, restrictions)
+    if (dirNameMaxBytes) {
+      issues.push({ type: 'dirNameMaxBytes', name, platform, dirNameMaxBytes })
+    }
+  } else if (type === 'file') {
+    const nameMaxBytes = detectNameLengthIssue(name, restrictions)
+    if (nameMaxBytes) {
+      issues.push({ type: 'nameMaxBytes', name, platform, nameMaxBytes })
+    }
+  }
+
+  return issues
+}
+
+// Identifies issues in every path item that will prevent local synchronization
+function detectPathIssues(
+  path /*: string */,
+  type /*: string */
+) /*: Array&lt;PathIssue> */ {
+  const platform = process.platform
+  const ancestorNames = path.split(sep)
+  const basename = ancestorNames.pop()
+
+  const pathIssues = detectNameIssues(basename, type, platform).map(nameIssue =>
+    _.merge({ path }, nameIssue)
+  )
+
+  const recursivePathIssues = ancestorNames.reduceRight(
+    (previousIssues, name, index, pathComponents) => {
+      const path = pathComponents.slice(0, index + 1).join(sep)
+      const nameIssues = detectNameIssues(name, 'folder', platform)
+
+      return previousIssues.concat(
+        nameIssues.map(issue => _.merge({ path }, issue))
+      )
+    },
+    pathIssues
+  )
+
+  return recursivePathIssues.filter(issue => issue != null)
+}
+
+function detectPathLengthIssue(
+  path /*: string */,
+  platform /*: string */
+) /*: ?PathLengthIssue */ {
+  const { pathMaxBytes } = restrictionsByPlatform(platform)
+  const pathBytes = Buffer.byteLength(path) // TODO: utf16?
+  if (pathBytes > pathMaxBytes) {
+    // FIXME: The name is useless, but could not find a way to make flow happy
+    // without it.
+    return { name: path, path, pathBytes, pathMaxBytes, platform }
+  }
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_await_write_finish.html">core/local/atom/await_write_finish</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_atom_win_detect_move.html">core/local/atom/win_detect_move</a></li><li><a href="module-core_local_atom_win_identical_renaming.html">core/local/atom/win_identical_renaming</a></li><li><a href="module-core_local_checksumer.html">core/local/checksumer</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li><li><a href="module-test_support_builders_db.html">test/support/builders/db</a></li><li><a href="module-test_support_builders_stats.html">test/support/builders/stats</a></li><li><a href="module-test_support_coverage.html">test/support/coverage</a></li><li><a href="module-test_support_helpers_scenarios.html">test/support/helpers/scenarios</a></li></ul><h3>Classes</h3><ul><li><a href="module-core_ignore-Ignore.html">Ignore</a></li><li><a href="module-core_local_atom_channel-Channel.html">Channel</a></li><li><a href="module-core_local_atom_producer-Producer.html">Producer</a></li><li><a href="module-core_local_chokidar_event_buffer-EventBuffer.html">EventBuffer</a></li><li><a href="module-core_local_chokidar_watcher-LocalWatcher.html">LocalWatcher</a></li><li><a href="module-core_local-Local.html">Local</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_remote_cozy-RemoteCozy.html">RemoteCozy</a></li><li><a href="module-core_remote_watcher-RemoteWatcher.html">RemoteWatcher</a></li><li><a href="module-core_utils_sorted_set-SortedSet.html">SortedSet</a></li><li><a href="module-test_support_builders_stats-DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-test_support_builders_stats-WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#UPDATE_CHECK_TIMEOUT">UPDATE_CHECK_TIMEOUT</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

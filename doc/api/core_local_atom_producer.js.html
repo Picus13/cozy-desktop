@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/local/atom/producer.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/local/atom/producer.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/**
+ * @module core/local/atom/producer
+ * @flow
+ */
+
+const autoBind = require('auto-bind')
+const fse = require('fs-extra') // Used for await
+const path = require('path')
+const Promise = require('bluebird')
+const watcher = require('@atom/watcher')
+
+const Channel = require('./channel')
+const { INITIAL_SCAN_DONE } = require('./event')
+const defaultStater = require('../stater')
+const logger = require('../../utils/logger')
+
+/*::
+import type { Ignore } from '../../ignore'
+import type { AtomEvent } from './event'
+
+export type Scanner = (string) => Promise&lt;void>
+*/
+
+const log = logger({
+  component: 'atom/Producer'
+})
+
+const isIgnored = ({ path, kind }, ignore) =>
+  ignore.isIgnored({
+    relativePath: path,
+    isFolder: kind === 'directory'
+  })
+
+/**
+ * This class is a producer: it watches the filesystem and the events are
+ * created here.
+ *
+ * On Windows:
+ *   the API used for FS notifications is ReadDirectoryChangesW. It is
+ *   recursive and works without too many darts. Still, it doesn't detect the
+ *   moves and atom/watcher can misunderstand renaming with just case swapping
+ *   (Foo -> foo).
+ *
+ *   Another important thing to know is that we need to scan added directories: if
+ *   the directory was restored from the trash or moved from outside the watched
+ *   directory, ReadDirectoryChangesW won't send us events for the files and
+ *   sub-directories.
+ *
+ * On Linux:
+ *   the API used for FS notifications is inotify and is not recursive. It
+ *   means that we have to add a watcher when we a new directory is added (and to
+ *   remove a watcher when a watched directory is removed).
+ *
+ *   Even if inotify has a IN_ISDIR hint, atom/watcher does not report it. So, we
+ *   have to call stat on the path to know if it's a file or a directory for add
+ *   and update events.
+ */
+class Producer {
+  /*::
+  channel: Channel
+  syncPath: string
+  ignore: Ignore
+  watcher: *
+  */
+  constructor(opts /*: { syncPath: string, ignore: Ignore } */) {
+    this.channel = new Channel()
+    this.syncPath = opts.syncPath
+    this.ignore = opts.ignore
+    this.watcher = null
+    autoBind(this)
+  }
+
+  /**
+   * Atom/watcher has a recursive option, even on Linux. It just calls inotify
+   * on each sub-directory. Using this option has some pros and cons:
+   *
+   * - Pro: we don't have to explicitely manage the inotify watchers on Linux
+   * - Pro: move/rename detection is made by atom/watcher on Linux
+   * - Con: the sync dir must be scanned twice on Linux, once by atom/watcher
+   *   to put the inotify watchers, and once by Producer for the initial scan
+   * - Con: when a new directory is detected, we must scan it twice on Linux,
+   *   once by atom-watcher to put inotify watchers on sub-directories that can
+   *   have been added faster that the event has bubbled, and once by the local
+   *   watcher (because it can be a directory that has been moved from outside
+   *   the synchronized directory, and atom/watcher doesn't emit events in that
+   *   case).
+   *
+   * As atom/watcher doesn't give use the inotify cookies, the move/rename
+   * detection is probably the harder of the four tasks. So, we choosed to use
+   * the recursive option.
+   */
+  async start() {
+    this.watcher = await watcher.watchPath(
+      this.syncPath,
+      { recursive: true },
+      this.process
+    )
+    log.info(`Now watching ${this.syncPath}`)
+    if (process.platform === 'linux') {
+      // TODO to be checked, but we might need to give some time to
+      // atom/watcher to finish putting its inotify watches on sub-directories.
+      await Promise.delay(1000)
+    }
+    await this.scan('.')
+    log.trace('Scan done')
+    // The initial scan can miss some files or directories that have been
+    // moved. Wait a bit to ensure that the corresponding renamed events have
+    // been emited.
+    await Promise.delay(1000)
+    this.channel.push([INITIAL_SCAN_DONE])
+  }
+
+  async scan(
+    relPath /*: string */,
+    {
+      readdir = fse.readdir,
+      stater = defaultStater
+    } /*: { readdir: *, stater: * } */ = {}
+  ) {
+    const entries = []
+    const fullPath = path.join(this.syncPath, relPath)
+    for (const entry of await readdir(fullPath)) {
+      try {
+        const absPath = path.join(this.syncPath, relPath, entry)
+        const stats = await stater.statMaybe(absPath)
+        const incomplete = stats == null
+        const scanEvent /*: AtomEvent */ = {
+          action: 'scan',
+          path: path.join(relPath, entry),
+          kind: stats ? stater.kind(stats) : 'unknown'
+        }
+        if (stats) scanEvent.stats = stats
+        if (incomplete) scanEvent.incomplete = incomplete
+        if (!isIgnored(scanEvent, this.ignore)) {
+          entries.push(scanEvent)
+        } else {
+          log.debug({ event: scanEvent }, 'Ignored via .cozyignore')
+        }
+      } catch (err) {
+        log.error({ err, path: path.join(relPath, entry) })
+      }
+    }
+    log.trace({ path: relPath, batch: entries }, 'scan')
+    this.channel.push(entries)
+
+    for (const entry of entries) {
+      if (entry.stats &amp;&amp; stater.isDirectory(entry.stats)) {
+        await this.scan(entry.path)
+      }
+    }
+  }
+
+  process(batch /*: Array&lt;*> */) {
+    log.trace({ batch }, 'process')
+    // Atom/watcher emits events with an absolute path, but it's more
+    // convenient for us to use a relative path.
+    for (const event of batch) {
+      event.path = path.relative(this.syncPath, event.path)
+      if (event.oldPath) {
+        event.oldPath = path.relative(this.syncPath, event.oldPath)
+      }
+    }
+    this.channel.push(batch)
+  }
+
+  stop() {
+    log.trace('Stop')
+    if (this.watcher) {
+      this.watcher.dispose()
+      this.watcher = null
+    }
+  }
+}
+
+module.exports = Producer
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_await_write_finish.html">core/local/atom/await_write_finish</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_atom_win_detect_move.html">core/local/atom/win_detect_move</a></li><li><a href="module-core_local_atom_win_identical_renaming.html">core/local/atom/win_identical_renaming</a></li><li><a href="module-core_local_checksumer.html">core/local/checksumer</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li><li><a href="module-test_support_builders_db.html">test/support/builders/db</a></li><li><a href="module-test_support_builders_stats.html">test/support/builders/stats</a></li><li><a href="module-test_support_coverage.html">test/support/coverage</a></li><li><a href="module-test_support_helpers_scenarios.html">test/support/helpers/scenarios</a></li></ul><h3>Classes</h3><ul><li><a href="module-core_ignore-Ignore.html">Ignore</a></li><li><a href="module-core_local_atom_channel-Channel.html">Channel</a></li><li><a href="module-core_local_atom_producer-Producer.html">Producer</a></li><li><a href="module-core_local_chokidar_event_buffer-EventBuffer.html">EventBuffer</a></li><li><a href="module-core_local_chokidar_watcher-LocalWatcher.html">LocalWatcher</a></li><li><a href="module-core_local-Local.html">Local</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_remote_cozy-RemoteCozy.html">RemoteCozy</a></li><li><a href="module-core_remote_watcher-RemoteWatcher.html">RemoteWatcher</a></li><li><a href="module-core_utils_sorted_set-SortedSet.html">SortedSet</a></li><li><a href="module-test_support_builders_stats-DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-test_support_builders_stats-WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#UPDATE_CHECK_TIMEOUT">UPDATE_CHECK_TIMEOUT</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

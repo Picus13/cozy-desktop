@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/remote/index.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/remote/index.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/** The remote side read/write interface.
+ *
+ * @module core/remote
+ * @flow
+ */
+
+const autoBind = require('auto-bind')
+const Promise = require('bluebird')
+const path = require('path')
+const { posix, sep } = path
+
+const { RemoteCozy } = require('./cozy')
+const { RemoteWarningPoller } = require('./warning_poller')
+const { RemoteWatcher } = require('./watcher')
+const { withContentLength } = require('../file_stream_provider')
+const logger = require('../utils/logger')
+const measureTime = require('../utils/perfs')
+
+/*::
+import type EventEmitter from 'events'
+import type { Config } from '../config'
+import type { Metadata } from '../metadata'
+import type Pouch from '../pouch'
+import type Prep from '../prep'
+import type { RemoteDoc } from './document'
+import type { FileStreamProvider, ReadableWithContentLength } from '../file_stream_provider' // eslint-disable-line
+import type { Side } from '../side' // eslint-disable-line
+*/
+
+const log = logger({
+  component: 'RemoteWriter'
+})
+
+/*::
+export type RemoteOptions = {
+  config: Config,
+  events: EventEmitter,
+  pouch: Pouch,
+  prep: Prep
+}
+*/
+
+class Remote /*:: implements Side */ {
+  /*::
+  other: FileStreamProvider
+  pouch: Pouch
+  events: EventEmitter
+  watcher: RemoteWatcher
+  remoteCozy: RemoteCozy
+  warningsPoller: RemoteWarningPoller
+  */
+
+  constructor({ config, prep, pouch, events } /*: RemoteOptions */) {
+    this.pouch = pouch
+    this.events = events
+    this.remoteCozy = new RemoteCozy(config)
+    this.warningsPoller = new RemoteWarningPoller(this.remoteCozy, events)
+    this.watcher = new RemoteWatcher(pouch, prep, this.remoteCozy, events)
+
+    autoBind(this)
+  }
+
+  start() {
+    const { started, running } = this.watcher.start()
+    return {
+      started: started.then(() => this.warningsPoller.start()),
+      running
+    }
+  }
+
+  stop() {
+    return Promise.all([this.watcher.stop(), this.warningsPoller.stop()])
+  }
+
+  sendMail(args /*: any */) {
+    return this.remoteCozy.createJob('sendmail', args)
+  }
+
+  unregister() {
+    return this.remoteCozy.unregister()
+  }
+
+  /** Create a readable stream for the given doc */
+  async createReadStreamAsync(
+    doc /*: Metadata */
+  ) /*: Promise&lt;ReadableWithContentLength> */ {
+    const stream = await this.remoteCozy.downloadBinary(doc.remote._id)
+    return withContentLength(stream, doc.size)
+  }
+
+  /** Create a folder on the remote cozy instance */
+  async addFolderAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    const { path } = doc
+    log.info({ path }, 'Creating folder...')
+
+    const [parentPath, name] = dirAndName(doc.path)
+    const parent /*: RemoteDoc */ = await this.remoteCozy.findOrCreateDirectoryByPath(
+      parentPath
+    )
+    let dir /*: RemoteDoc */
+
+    try {
+      dir = await this.remoteCozy.createDirectory({
+        name,
+        dirID: parent._id,
+        lastModifiedDate: doc.updated_at
+      })
+    } catch (err) {
+      if (err.status !== 409) {
+        throw err
+      }
+
+      log.info({ path }, 'Folder already exists')
+      const remotePath = '/' + posix.join(...doc.path.split(sep))
+      dir = await this.remoteCozy.findDirectoryByPath(remotePath)
+    }
+
+    doc.remote = {
+      _id: dir._id,
+      _rev: dir._rev
+    }
+  }
+
+  async addFileAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    const { path } = doc
+    log.info({ path }, 'Uploading new file...')
+    const stopMeasure = measureTime('RemoteWriter#addFile')
+
+    let stream /*: ReadableWithContentLength */
+    try {
+      stream = await this.other.createReadStreamAsync(doc)
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        log.warn({ path }, 'Local file does not exist anymore.')
+        doc._deleted = true // XXX: This prevents the doc to be saved with new revs
+        return doc
+      }
+      throw err
+    }
+
+    const [dirPath, name] = dirAndName(path)
+    const dir = await this.remoteCozy.findOrCreateDirectoryByPath(dirPath)
+
+    const created = await this.remoteCozy.createFile(stream, {
+      name,
+      dirID: dir._id,
+      checksum: doc.md5sum,
+      executable: doc.executable,
+      contentLength: stream.contentLength,
+      contentType: doc.mime,
+      lastModifiedDate: new Date(doc.updated_at)
+    })
+
+    doc.remote = {
+      _id: created._id,
+      _rev: created._rev
+    }
+
+    stopMeasure()
+  }
+
+  async overwriteFileAsync(
+    doc /*: Metadata */,
+    old /*: ?Metadata */
+  ) /*: Promise&lt;void> */ {
+    const { path } = doc
+    log.info({ path }, 'Uploading new file version...')
+
+    let stream
+    try {
+      stream = await this.other.createReadStreamAsync(doc)
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        log.warn({ path }, 'Local file does not exist anymore.')
+        doc._deleted = true // XXX: This prevents the doc to be saved with new revs
+        return doc
+      }
+      throw err
+    }
+
+    const options = {
+      contentType: doc.mime,
+      checksum: doc.md5sum,
+      lastModifiedDate: new Date(doc.updated_at),
+      ifMatch: ''
+    }
+    if (old &amp;&amp; old.remote) {
+      options.ifMatch = old.remote._rev
+    }
+    const updated = await this.remoteCozy.updateFileById(
+      doc.remote._id,
+      stream,
+      options
+    )
+
+    doc.remote._rev = updated._rev
+  }
+
+  async updateFileMetadataAsync(
+    doc /*: Metadata */,
+    old /*: any */
+  ) /*: Promise&lt;void> */ {
+    const { path } = doc
+    log.info({ path }, 'Updating file metadata...')
+
+    const attrs = {
+      executable: doc.executable || false,
+      updated_at: doc.updated_at
+    }
+    const opts = {
+      ifMatch: old.remote._rev
+    }
+    const updated = await this.remoteCozy.updateAttributesById(
+      old.remote._id,
+      attrs,
+      opts
+    )
+
+    doc.remote = {
+      _id: updated._id,
+      _rev: updated._rev
+    }
+  }
+
+  async moveFileAsync(
+    newMetadata /*: Metadata */,
+    oldMetadata /*: Metadata */
+  ) /*: Promise&lt;void> */ {
+    const { path } = newMetadata
+    log.info({ path, oldpath: oldMetadata.path }, 'Moving file')
+
+    const [newDirPath, newName] /*: [string, string] */ = dirAndName(path)
+    const newDir /*: RemoteDoc */ = await this.remoteCozy.findDirectoryByPath(
+      newDirPath
+    )
+
+    const attrs = {
+      name: newName,
+      dir_id: newDir._id,
+      updated_at: newMetadata.updated_at
+    }
+    const opts = {
+      ifMatch: oldMetadata.remote._rev
+    }
+
+    let newRemoteDoc /*: RemoteDoc */ = await this.remoteCozy.updateAttributesById(
+      oldMetadata.remote._id,
+      attrs,
+      opts
+    )
+
+    newMetadata.remote = {
+      _id: newRemoteDoc._id,
+      _rev: newRemoteDoc._rev
+    }
+  }
+
+  async updateFolderAsync(
+    doc /*: Metadata */,
+    old /*: Metadata */
+  ) /*: Promise&lt;void> */ {
+    const { path } = doc
+    if (!old.remote) {
+      return this.addFolderAsync(doc)
+    }
+    log.info({ path }, 'Updating metadata...')
+
+    const [newParentDirPath, newName] = dirAndName(path)
+    const newParentDir = await this.remoteCozy.findDirectoryByPath(
+      newParentDirPath
+    )
+    let newRemoteDoc /*: RemoteDoc */
+
+    const attrs = {
+      name: newName,
+      dir_id: newParentDir._id,
+      updated_at: doc.updated_at
+    }
+    const opts = {
+      ifMatch: old.remote._rev
+    }
+
+    try {
+      newRemoteDoc = await this.remoteCozy.updateAttributesById(
+        old.remote._id,
+        attrs,
+        opts
+      )
+    } catch (err) {
+      if (err.status !== 404) {
+        throw err
+      }
+
+      log.warn({ path }, "Directory doesn't exist anymore. Recreating it...")
+      newRemoteDoc = await this.remoteCozy.createDirectory({
+        name: newName,
+        dirID: newParentDir._id,
+        lastModifiedDate: doc.updated_at
+      })
+    }
+
+    doc.remote = {
+      _id: newRemoteDoc._id,
+      _rev: newRemoteDoc._rev
+    }
+  }
+
+  async trashAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    const { path } = doc
+    log.info({ path }, 'Moving to the trash...')
+    let newRemoteDoc /*: RemoteDoc */
+    try {
+      newRemoteDoc = await this.remoteCozy.trashById(doc.remote._id, {
+        ifMatch: doc.remote._rev
+      })
+    } catch (err) {
+      if (err.status === 404) {
+        log.warn({ path }, `Cannot trash remotely deleted ${doc.docType}.`)
+        return
+      }
+      throw err
+    }
+    doc.remote._rev = newRemoteDoc._rev
+  }
+
+  async deleteFolderAsync(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    await this.trashAsync(doc)
+    const { path } = doc
+
+    try {
+      if (await this.remoteCozy.isEmpty(doc.remote._id)) {
+        log.info({ path }, 'Deleting folder from the Cozy trash...')
+        const opts = doc.remote._rev ? { ifMatch: doc.remote._rev } : undefined
+        await this.remoteCozy.destroyById(doc.remote._id, opts)
+      } else {
+        log.warn({ path }, 'Folder is not empty and cannot be deleted!')
+      }
+    } catch (err) {
+      if (err.status === 404) return
+      throw err
+    }
+  }
+
+  async assignNewRev(doc /*: Metadata */) /*: Promise&lt;void> */ {
+    log.info({ path: doc.path }, 'Assigning new rev...')
+    const { _rev } = await this.remoteCozy.client.files.statById(doc.remote._id)
+    doc.remote._rev = _rev
+  }
+
+  async moveFolderAsync(
+    newMetadata /*: Metadata */,
+    oldMetadata /*: Metadata */
+  ) /*: Promise&lt;void> */ {
+    // FIXME: same as moveFileAsync? Rename to moveAsync?
+    const { path } = newMetadata
+    log.info({ path, oldpath: oldMetadata.path }, 'Moving dir')
+
+    const [newDirPath, newName] /*: [string, string] */ = dirAndName(path)
+    const newDir /*: RemoteDoc */ = await this.remoteCozy.findDirectoryByPath(
+      newDirPath
+    )
+
+    const attrs = {
+      name: newName,
+      dir_id: newDir._id,
+      updated_at: newMetadata.updated_at
+    }
+    const opts = {
+      ifMatch: oldMetadata.remote._rev
+    }
+
+    const newRemoteDoc /*: RemoteDoc */ = await this.remoteCozy.updateAttributesById(
+      oldMetadata.remote._id,
+      attrs,
+      opts
+    )
+
+    newMetadata.remote = {
+      _id: newRemoteDoc._id, // XXX: Why do we reassign id? Isn't it the same as before?
+      _rev: newRemoteDoc._rev
+    }
+  }
+
+  diskUsage() /*: Promise&lt;*> */ {
+    return this.remoteCozy.diskUsage()
+  }
+
+  // TODO add tests
+  async renameConflictingDocAsync(
+    doc /*: Metadata */,
+    newPath /*: string */
+  ) /*: Promise&lt;void> */ {
+    const { path } = doc
+    log.info({ path }, `Resolve a conflict: ${path} → ${newPath}`)
+    const newName = dirAndName(newPath)[1]
+    await this.remoteCozy.updateAttributesById(doc.remote._id, {
+      name: newName
+    })
+  }
+}
+
+/** Extract the remote parent path and leaf name from a local path */
+function dirAndName(localPath /*: string */) /*: [string, string] */ {
+  const dir =
+    '/' +
+    localPath
+      .split(path.sep)
+      .slice(0, -1)
+      .join('/')
+  const name = path.basename(localPath)
+  return [dir, name]
+}
+
+module.exports = {
+  Remote,
+  dirAndName
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_await_write_finish.html">core/local/atom/await_write_finish</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_atom_win_detect_move.html">core/local/atom/win_detect_move</a></li><li><a href="module-core_local_atom_win_identical_renaming.html">core/local/atom/win_identical_renaming</a></li><li><a href="module-core_local_checksumer.html">core/local/checksumer</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li><li><a href="module-test_support_builders_db.html">test/support/builders/db</a></li><li><a href="module-test_support_builders_stats.html">test/support/builders/stats</a></li><li><a href="module-test_support_coverage.html">test/support/coverage</a></li><li><a href="module-test_support_helpers_scenarios.html">test/support/helpers/scenarios</a></li></ul><h3>Classes</h3><ul><li><a href="module-core_ignore-Ignore.html">Ignore</a></li><li><a href="module-core_local_atom_channel-Channel.html">Channel</a></li><li><a href="module-core_local_atom_producer-Producer.html">Producer</a></li><li><a href="module-core_local_chokidar_event_buffer-EventBuffer.html">EventBuffer</a></li><li><a href="module-core_local_chokidar_watcher-LocalWatcher.html">LocalWatcher</a></li><li><a href="module-core_local-Local.html">Local</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_remote_cozy-RemoteCozy.html">RemoteCozy</a></li><li><a href="module-core_remote_watcher-RemoteWatcher.html">RemoteWatcher</a></li><li><a href="module-core_utils_sorted_set-SortedSet.html">SortedSet</a></li><li><a href="module-test_support_builders_stats-DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-test_support_builders_stats-WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#UPDATE_CHECK_TIMEOUT">UPDATE_CHECK_TIMEOUT</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: IdConflict.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: IdConflict.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/* @flow */
+
+/** An identity conflict is a conflict where two files/dirs can coexist on the
+ * remote side but not on the local one because they would be considered the
+ * same by the file system.
+ *
+ * In case a remote doc was already merged and some just added local doc has an
+ * identity that conflicts with the former (race condition), renaming the local
+ * doc would still prevent the remote one from being written locally.
+ *
+ * This is why identity conflicts are always resolved on the remote side.
+ *
+ * @module core/IdConflict
+ */
+
+const _ = require('lodash')
+
+/*::
+import type { Metadata, SideName } from './metadata'
+
+type Change = {
+  side: SideName,
+  doc: Metadata,
+  was?: Metadata
+}
+// TODO: Pass Change objects to Merge methods too.
+
+export opaque type IdConflictInfo = {
+  change: Change,
+  existingDoc: Metadata,
+  platform: string
+}
+*/
+
+module.exports = {
+  description,
+  detect,
+  detectOnId,
+  existsBetween
+}
+
+const { platform } = process
+
+/** Human readable description of the conflict */
+function description(
+  { change, existingDoc, platform } /*: IdConflictInfo */
+) /*: string */ {
+  const newPathRepr = JSON.stringify(change.doc.path)
+  const existingPathRepr = JSON.stringify(existingDoc.path)
+  const idRepr = JSON.stringify(existingDoc._id)
+  return (
+    `Identity conflict between new ${change.side} ${
+      change.doc.docType
+    } ${newPathRepr} ` +
+    `and existing ${existingDoc.docType} ${existingPathRepr}: ` +
+    `both would get the same ${idRepr} id on ${platform}.`
+  )
+}
+
+/** Return IdConflictInfo in case `change.doc` and `existingDoc` cannot coexist
+ * on the current platform.
+ */
+function detect(
+  change /*: Change */,
+  existingDoc /*: ?Metadata */
+) /*: ?IdConflictInfo */ {
+  if (existingDoc &amp;&amp; existsBetween(change, existingDoc)) {
+    return {
+      change,
+      existingDoc,
+      platform
+    }
+  }
+}
+
+function detectOnId(
+  { doc, was } /*: $Diff&lt;Change, {side: SideName}> */,
+  existingDoc /*: Metadata */
+) /*: boolean */ {
+  return (
+    doc._id === existingDoc._id &amp;&amp;
+    doc.path !== existingDoc.path &amp;&amp;
+    (was == null || was.path !== existingDoc.path)
+  )
+}
+
+function detectOnRemote(
+  { doc } /*: $Diff&lt;Change, {side: SideName}> */,
+  existingDoc /*: Metadata */
+) /*: boolean */ {
+  return _.get(doc, 'remote._id') !== _.get(existingDoc, 'remote._id')
+}
+
+/** Does an identity conflict exist between a change and an existing doc?
+ *
+ * The side is not used here, hence the $Diff flow type annotation.
+ */
+function existsBetween(
+  change /*: $Diff&lt;Change, {side: SideName}> */,
+  existingDoc /*: Metadata */
+) /*: boolean */ {
+  return detectOnId(change, existingDoc) &amp;&amp; detectOnRemote(change, existingDoc)
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_win_identical_renaming.html">core/local/atom/win_identical_renaming</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_sync.html">core/sync</a></li></ul><h3>Classes</h3><ul><li><a href="MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module.exports.html">exports</a></li><li><a href="module-core_app-App.html">App</a></li><li><a href="module-core_config-Config.html">Config</a></li><li><a href="module-core_sync-Sync.html">Sync</a></li></ul><h3>Global</h3><ul><li><a href="global.html#only">only</a></li><li><a href="global.html#producer">producer</a></li><li><a href="global.html#steps">steps</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a> on Fri Jun 14 2019 11:57:54 GMT+0200 (CEST)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: core/local/atom/win_detect_move.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: core/local/atom/win_detect_move.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>/** This step aggregates deleted &amp; added events into renamed ones on Windows.
+ *
+ * On windows, ReadDirectoryChangesW emits a deleted and an added events when
+ * a file or directory is moved. This step merges the two events to a single
+ * renamed event.
+ *
+ * @module core/local/atom/win_detect_move
+ * @flow
+ */
+
+const _ = require('lodash')
+const path = require('path')
+
+const SortedSet = require('../../utils/sorted_set')
+const { id } = require('../../metadata')
+const Channel = require('./channel')
+const logger = require('../../utils/logger')
+
+const STEP_NAME = 'winDetectMove'
+
+const log = logger({
+  component: `atom/${STEP_NAME}`
+})
+
+/** Wait at most this delay (in milliseconds) to see if it's a move.
+ *
+ * TODO: tweak the value (the initial value was chosen because it looks like a
+ * good value, it is not something that was computed).
+ */
+const DELAY = 1000
+
+/*::
+import type { AtomEvent, AtomBatch } from './event'
+import type Pouch from '../../pouch'
+
+type PendingItem = {
+  event: AtomEvent,
+  deletedIno: ?string | ?number,
+  timeout: TimeoutID
+}
+
+export type WinDetectMoveState = {
+  [typeof STEP_NAME]: {
+    unmergedRenamedEvents: SortedSet&lt;AtomEvent>
+  }
+}
+
+type WinDetectMoveOptions = {
+  pouch: Pouch,
+  state: WinDetectMoveState
+}
+*/
+
+module.exports = {
+  forget,
+  initialState,
+  loop
+}
+
+const areParentChildPaths = (p /*: string */, c /*: string */) /*: boolean */ =>
+  `${c}${path.sep}`.startsWith(`${p}${path.sep}`)
+
+async function initialState() /* Promise&lt;WinDetectMoveState> */ {
+  return {
+    [STEP_NAME]: {
+      // eslint-disable-next-line
+      unmergedRenamedEvents: new SortedSet /*:: &lt;AtomEvent> */ ()
+    }
+  }
+}
+
+function forget(event /*: AtomEvent */, state /*: WinDetectMoveState */) {
+  const {
+    [STEP_NAME]: { unmergedRenamedEvents }
+  } = state
+
+  unmergedRenamedEvents.delete(event)
+}
+
+function previousPaths(deletedPath, unmergedRenamedEvents) {
+  const { previous: previousPaths } = unmergedRenamedEvents.reduceRight(
+    (paths, renamedEvent) => {
+      if (
+        renamedEvent.oldPath &amp;&amp;
+        areParentChildPaths(renamedEvent.path, paths.current)
+      ) {
+        paths.current = paths.current.replace(
+          renamedEvent.path,
+          renamedEvent.oldPath
+        )
+        paths.previous.unshift(paths.current)
+      }
+      return paths
+    },
+    {
+      current: deletedPath,
+      previous: []
+    }
+  )
+  return previousPaths
+}
+
+async function findDeletedInoById(id, pouch) {
+  const doc = await pouch.byIdMaybeAsync(id)
+  return doc &amp;&amp; { deletedIno: doc.fileid || doc.ino }
+}
+
+async function findDeletedInoRecentlyRenamed(previousPaths, pouch) {
+  for (const [index, previousPath] of previousPaths.entries()) {
+    const doc = await pouch.byIdMaybeAsync(id(previousPath))
+    if (doc) {
+      return {
+        deletedIno: doc.fileid || doc.ino,
+        oldPaths: previousPaths.slice(index)
+      }
+    }
+  }
+}
+
+async function findDeletedIno(event, pouch, unmergedRenamedEvents) {
+  if (event.action !== 'deleted') return {}
+  // OPTIMIZE: Make .previousPaths() include event.path so we don't need a lock
+  const release = await pouch.lock('winDetectMove')
+  try {
+    return (
+      (await findDeletedInoById(event._id, pouch)) ||
+      (await findDeletedInoRecentlyRenamed(
+        previousPaths(event.path, unmergedRenamedEvents),
+        pouch
+      )) ||
+      {}
+    )
+  } finally {
+    release()
+  }
+}
+
+async function assignDebugInfos(event, deletedIno, oldPaths) {
+  if (event.action !== 'deleted') return
+  if (oldPaths) {
+    _.set(event, [STEP_NAME, 'oldPaths'], oldPaths)
+  } else if (!deletedIno) {
+    _.set(event, [STEP_NAME, 'deletedIno'], 'unresolved')
+  }
+}
+
+function eventHasIno(event, ino) {
+  return ino === (event.stats.fileid || event.stats.ino)
+}
+
+function indexOfMatchingDeletedEvent(event, pendingItems) {
+  if (event.action === 'created' &amp;&amp; !event.incomplete) {
+    for (let i = 0; i &lt; pendingItems.length; i++) {
+      const { deletedIno } = pendingItems[i]
+      if (deletedIno &amp;&amp; eventHasIno(event, deletedIno)) {
+        return i
+      }
+    }
+  }
+  return -1
+}
+
+function aggregateEvents(createdEvent, deletedEvent) {
+  const aggregatedEvents = {
+    deletedEvent,
+    createdEvent: _.clone(createdEvent)
+  }
+  createdEvent.action = 'renamed'
+  createdEvent.oldPath = deletedEvent.path
+  _.set(createdEvent, [STEP_NAME, 'aggregatedEvents'], aggregatedEvents)
+}
+
+function sendReadyBatches(
+  waiting /*: PendingItem[] */,
+  output /*: (AtomBatch) => void */
+) {
+  while (waiting.length > 0) {
+    if (waiting[0].deletedIno) {
+      break
+    }
+    const item = waiting.shift()
+    clearTimeout(item.timeout)
+    output([item.event])
+  }
+}
+
+async function winDetectMove(
+  channel,
+  output,
+  opts /*: WinDetectMoveOptions */
+) {
+  const pendingItems /*: PendingItem[] */ = []
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    // Wait for a new batch of events
+    const events = await channel.pop()
+    const {
+      pouch,
+      state: {
+        [STEP_NAME]: { unmergedRenamedEvents }
+      }
+    } = opts
+
+    for (const event of events) {
+      // First, push the new events in the pending queue
+      const { deletedIno, oldPaths } = await findDeletedIno(
+        event,
+        pouch,
+        unmergedRenamedEvents
+      )
+
+      assignDebugInfos(event, deletedIno, oldPaths)
+
+      const timeout = setTimeout(() => {
+        output([pendingItems.shift().event])
+        sendReadyBatches(pendingItems, output)
+      }, DELAY)
+      pendingItems.push({ event, deletedIno, timeout })
+
+      // Then, see if a created event matches a deleted event
+      const pendingIndex = indexOfMatchingDeletedEvent(event, pendingItems)
+      if (pendingIndex !== -1) {
+        const pendingDeleted = pendingItems[pendingIndex]
+        aggregateEvents(event, pendingDeleted.event)
+        clearTimeout(pendingDeleted.timeout)
+        pendingItems.splice(pendingIndex, 1)
+        unmergedRenamedEvents.add(event)
+      }
+    }
+
+    // Finally, look if some batches can be sent without waiting
+    sendReadyBatches(pendingItems, output)
+  }
+}
+
+function loop(
+  channel /*: Channel */,
+  opts /*: WinDetectMoveOptions */
+) /*: Channel */ {
+  const out = new Channel()
+  const output = batch => {
+    out.push(batch)
+  }
+  winDetectMove(channel, output, opts).catch(err => {
+    log.error({ err })
+  })
+  return out
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-core.html">core</a></li><li><a href="module-core_app.html">core/app</a></li><li><a href="module-core_config.html">core/config</a></li><li><a href="module-core_file_stream_provider.html">core/file_stream_provider</a></li><li><a href="module-core_globals.html">core/globals</a></li><li><a href="module-core_IdConflict.html">core/IdConflict</a></li><li><a href="module-core_ignore.html">core/ignore</a></li><li><a href="module-core_local.html">core/local</a></li><li><a href="module-core_local_atom_add_checksum.html">core/local/atom/add_checksum</a></li><li><a href="module-core_local_atom_add_infos.html">core/local/atom/add_infos</a></li><li><a href="module-core_local_atom_await_write_finish.html">core/local/atom/await_write_finish</a></li><li><a href="module-core_local_atom_channel.html">core/local/atom/channel</a></li><li><a href="module-core_local_atom_events.html">core/local/atom/events</a></li><li><a href="module-core_local_atom_filter_ignored.html">core/local/atom/filter_ignored</a></li><li><a href="module-core_local_atom_incomplete_fixer.html">core/local/atom/incomplete_fixer</a></li><li><a href="module-core_local_atom_initial_diff.html">core/local/atom/initial_diff</a></li><li><a href="module-core_local_atom_overwrite.html">core/local/atom/overwrite</a></li><li><a href="module-core_local_atom_producer.html">core/local/atom/producer</a></li><li><a href="module-core_local_atom_scan_folder.html">core/local/atom/scan_folder</a></li><li><a href="module-core_local_atom_watcher.html">core/local/atom/watcher</a></li><li><a href="module-core_local_atom_win_detect_move.html">core/local/atom/win_detect_move</a></li><li><a href="module-core_local_atom_win_identical_renaming.html">core/local/atom/win_identical_renaming</a></li><li><a href="module-core_local_checksumer.html">core/local/checksumer</a></li><li><a href="module-core_local_chokidar_analysis.html">core/local/chokidar/analysis</a></li><li><a href="module-core_local_chokidar_event.html">core/local/chokidar/event</a></li><li><a href="module-core_local_chokidar_event_buffer.html">core/local/chokidar/event_buffer</a></li><li><a href="module-core_local_chokidar_initial_scan.html">core/local/chokidar/initial_scan</a></li><li><a href="module-core_local_chokidar_local_change.html">core/local/chokidar/local_change</a></li><li><a href="module-core_local_chokidar_local_event.html">core/local/chokidar/local_event</a></li><li><a href="module-core_local_chokidar_prepare_events.html">core/local/chokidar/prepare_events</a></li><li><a href="module-core_local_chokidar_send_to_prep.html">core/local/chokidar/send_to_prep</a></li><li><a href="module-core_local_chokidar_watcher.html">core/local/chokidar/watcher</a></li><li><a href="module-core_local_constants.html">core/local/constants</a></li><li><a href="module-core_local_stater.html">core/local/stater</a></li><li><a href="module-core_local_sync_dir.html">core/local/sync_dir</a></li><li><a href="module-core_local_watcher.html">core/local/watcher</a></li><li><a href="module-core_merge.html">core/merge</a></li><li><a href="module-core_metadata.html">core/metadata</a></li><li><a href="module-core_move.html">core/move</a></li><li><a href="module-core_path_restrictions.html">core/path_restrictions</a></li><li><a href="module-core_pouch.html">core/pouch</a></li><li><a href="module-core_prep.html">core/prep</a></li><li><a href="module-core_remote.html">core/remote</a></li><li><a href="module-core_remote_change.html">core/remote/change</a></li><li><a href="module-core_remote_constants.html">core/remote/constants</a></li><li><a href="module-core_remote_cozy.html">core/remote/cozy</a></li><li><a href="module-core_remote_document.html">core/remote/document</a></li><li><a href="module-core_remote_registration.html">core/remote/registration</a></li><li><a href="module-core_remote_user_action_required.html">core/remote/user_action_required</a></li><li><a href="module-core_remote_warning.html">core/remote/warning</a></li><li><a href="module-core_remote_warning_poller.html">core/remote/warning_poller</a></li><li><a href="module-core_remote_watcher.html">core/remote/watcher</a></li><li><a href="module-core_side.html">core/side</a></li><li><a href="module-core_sync.html">core/sync</a></li><li><a href="module-core_syncstate.html">core/syncstate</a></li><li><a href="module-core_utils_fs.html">core/utils/fs</a></li><li><a href="module-core_utils_logger.html">core/utils/logger</a></li><li><a href="module-core_utils_perfs.html">core/utils/perfs</a></li><li><a href="module-core_utils_sentry.html">core/utils/sentry</a></li><li><a href="module-core_utils_sorted_set.html">core/utils/sorted_set</a></li><li><a href="module-core_utils_timestamp.html">core/utils/timestamp</a></li><li><a href="module-dev_capture.html">dev/capture</a></li><li><a href="module-dev_capture_local.html">dev/capture/local</a></li><li><a href="module-dev_capture_remote.html">dev/capture/remote</a></li><li><a href="module-dev_remote_automated_registration.html">dev/remote/automated_registration</a></li><li><a href="module-gui_js_appmenu.html">gui/js/appmenu</a></li><li><a href="module-gui_js_autolaunch.html">gui/js/autolaunch</a></li><li><a href="module-gui_js_fileutils.html">gui/js/fileutils</a></li><li><a href="module-gui_js_i18n.html">gui/js/i18n</a></li><li><a href="module-gui_js_incompatibilitiesmsg.html">gui/js/incompatibilitiesmsg</a></li><li><a href="module-gui_js_lastfiles.html">gui/js/lastfiles</a></li><li><a href="module-gui_js_proxy.html">gui/js/proxy</a></li><li><a href="module-gui_js_shortcut.html">gui/js/shortcut</a></li><li><a href="module-gui_js_tray.html">gui/js/tray</a></li><li><a href="module-gui_js_window_manager.html">gui/js/window_manager</a></li><li><a href="module-test_support_builders.html">test/support/builders</a></li><li><a href="module-test_support_builders_db.html">test/support/builders/db</a></li><li><a href="module-test_support_builders_stats.html">test/support/builders/stats</a></li><li><a href="module-test_support_coverage.html">test/support/coverage</a></li><li><a href="module-test_support_helpers_scenarios.html">test/support/helpers/scenarios</a></li></ul><h3>Classes</h3><ul><li><a href="module-core_ignore-Ignore.html">Ignore</a></li><li><a href="module-core_local_atom_channel-Channel.html">Channel</a></li><li><a href="module-core_local_atom_producer-Producer.html">Producer</a></li><li><a href="module-core_local_chokidar_event_buffer-EventBuffer.html">EventBuffer</a></li><li><a href="module-core_local_chokidar_watcher-LocalWatcher.html">LocalWatcher</a></li><li><a href="module-core_local-Local.html">Local</a></li><li><a href="module-core_merge-MergeMissingParentError.html">MergeMissingParentError</a></li><li><a href="module-core_remote_cozy-RemoteCozy.html">RemoteCozy</a></li><li><a href="module-core_remote_watcher-RemoteWatcher.html">RemoteWatcher</a></li><li><a href="module-core_utils_sorted_set-SortedSet.html">SortedSet</a></li><li><a href="module-test_support_builders_stats-DefaultStatsBuilder.html">DefaultStatsBuilder</a></li><li><a href="module-test_support_builders_stats-WinStatsBuilder.html">WinStatsBuilder</a></li></ul><h3>Global</h3><ul><li><a href="global.html#UPDATE_CHECK_TIMEOUT">UPDATE_CHECK_TIMEOUT</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc3/jsdoc">JSDoc 3.5.5</a>
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
