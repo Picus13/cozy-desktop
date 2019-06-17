@@ -21,6 +21,43 @@ const log = logger({
   component: 'atom/Producer'
 })
 
+const scanner = ({ channel, syncPath }) =>
+  async function scan(
+    relPath /*: string */,
+    {
+      readdir = fse.readdir,
+      stater = defaultStater
+    } /*: { readdir: *, stater: * } */ = {}
+  ) {
+    const entries = []
+    const fullPath = path.join(syncPath, relPath)
+    for (const entry of await readdir(fullPath)) {
+      try {
+        const absPath = path.join(syncPath, relPath, entry)
+        const stats = await stater.statMaybe(absPath)
+        const incomplete = stats == null
+        const scanEvent /*: AtomEvent */ = {
+          action: 'scan',
+          path: path.join(relPath, entry),
+          kind: stats ? stater.kind(stats) : 'unknown'
+        }
+        if (stats) scanEvent.stats = stats
+        if (incomplete) scanEvent.incomplete = incomplete
+        entries.push(scanEvent)
+      } catch (err) {
+        log.error({ err, path: path.join(relPath, entry) })
+      }
+    }
+    log.trace({ path: relPath, batch: entries }, 'scan')
+    channel.push(entries)
+
+    for (const entry of entries) {
+      if (entry.stats && stater.isDirectory(entry.stats)) {
+        await scan(entry.path)
+      }
+    }
+  }
+
 // This class is a producer: it watches the filesystem and the events are
 // created here.
 //
@@ -48,11 +85,16 @@ class Producer {
   channel: Channel
   syncPath: string
   watcher: *
+  scan: *
   */
   constructor(opts /*: { syncPath : string } */) {
     this.channel = new Channel()
     this.syncPath = opts.syncPath
     this.watcher = null
+    this.scan = scanner({
+      channel: this.channel,
+      syncPath: opts.syncPath
+    })
     autoBind(this)
   }
 
@@ -92,42 +134,6 @@ class Producer {
     // been emited.
     await Promise.delay(1000)
     this.channel.push([INITIAL_SCAN_DONE])
-  }
-
-  async scan(
-    relPath /*: string */,
-    {
-      readdir = fse.readdir,
-      stater = defaultStater
-    } /*: { readdir: *, stater: * } */ = {}
-  ) {
-    const entries = []
-    const fullPath = path.join(this.syncPath, relPath)
-    for (const entry of await readdir(fullPath)) {
-      try {
-        const absPath = path.join(this.syncPath, relPath, entry)
-        const stats = await stater.statMaybe(absPath)
-        const incomplete = stats == null
-        const scanEvent /*: AtomEvent */ = {
-          action: 'scan',
-          path: path.join(relPath, entry),
-          kind: stats ? stater.kind(stats) : 'unknown'
-        }
-        if (stats) scanEvent.stats = stats
-        if (incomplete) scanEvent.incomplete = incomplete
-        entries.push(scanEvent)
-      } catch (err) {
-        log.error({ err, path: path.join(relPath, entry) })
-      }
-    }
-    log.trace({ path: relPath, batch: entries }, 'scan')
-    this.channel.push(entries)
-
-    for (const entry of entries) {
-      if (entry.stats && stater.isDirectory(entry.stats)) {
-        await this.scan(entry.path)
-      }
-    }
   }
 
   process(batch /*: Array<*> */) {

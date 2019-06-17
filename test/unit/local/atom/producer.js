@@ -27,7 +27,7 @@ onPlatforms(['linux', 'win32'], () => {
       })
     })
 
-    describe('scan()', () => {
+    describe('#scan()', () => {
       context('on readdir / stat race condition', () => {
         const missingFileName = 'i-am-missing'
         const readdir = async () => [missingFileName]
