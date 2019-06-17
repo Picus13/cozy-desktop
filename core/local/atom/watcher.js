@@ -4,7 +4,7 @@ const Promise = require('bluebird')
 const _ = require('lodash')
 
 const checksumer = require('./../checksumer')
-const Producer = require('./producer')
+const { Producer } = require('./producer')
 const addInfos = require('./add_infos')
 const filterIgnored = require('./filter_ignored')
 const winDetectMove = require('./win_detect_move')

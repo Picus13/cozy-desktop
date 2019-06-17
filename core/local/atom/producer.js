@@ -43,7 +43,7 @@ const log = logger({
 //   Even if inotify has a IN_ISDIR hint, atom/watcher does not report it. So, we
 //   have to call stat on the path to know if it's a file or a directory for add
 //   and update events.
-module.exports = class Producer {
+class Producer {
   /*::
   channel: Channel
   syncPath: string
@@ -150,4 +150,8 @@ module.exports = class Producer {
       this.watcher = null
     }
   }
+}
+
+module.exports = {
+  Producer
 }

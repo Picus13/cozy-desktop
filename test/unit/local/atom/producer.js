@@ -7,14 +7,14 @@ const os = require('os')
 const fs = require('fs')
 const path = require('path')
 
-const Producer = require('../../../../core/local/atom/producer')
+const { Producer } = require('../../../../core/local/atom/producer')
 const stater = require('../../../../core/local/stater')
 
 const { ContextDir } = require('../../../support/helpers/context_dir')
 const { onPlatforms } = require('../../../support/helpers/platform')
 
 onPlatforms(['linux', 'win32'], () => {
-  describe('core/local/atom/producer', () => {
+  describe('core/local/atom/producer.Producer', () => {
     let syncDir
     let syncPath
     let producer
