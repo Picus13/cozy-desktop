@@ -490,6 +490,10 @@ class Merge {
         metadata.markAsUnsyncable(side, src)
         metadata.markAsNew(dst)
         metadata.markSide(side, dst)
+      } else if (src.sides && !src.sides[side] && src.sides[otherSide(side)]) {
+        metadata.markAsUnsyncable(otherSide(side), src)
+        metadata.markAsNew(dst)
+        metadata.markSide(otherSide(side), dst)
       } else {
         move.child(side, src, dst)
       }
