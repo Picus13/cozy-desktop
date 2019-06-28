@@ -1,4 +1,7 @@
-/* @flow */
+/**
+ * @module core/local/chokidar/watcher
+ * @flow
+ */
 
 const autoBind = require('auto-bind')
 const Promise = require('bluebird')

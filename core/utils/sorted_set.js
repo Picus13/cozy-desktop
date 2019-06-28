@@ -1,4 +1,7 @@
-/* @flow */
+/**
+ * @module core/utils/sorted_set
+ * @flow
+ */
 
 /** Custom SortedSet implementation
  *

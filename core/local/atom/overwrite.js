@@ -1,4 +1,8 @@
-/* @flow */
+/** This step handles file additions/moves overwriting their destination.
+ *
+ * @module core/local/atom/overwrite
+ * @flow
+ */
 
 const _ = require('lodash')
 

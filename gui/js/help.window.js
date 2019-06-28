@@ -1,3 +1,8 @@
+/** A window allowing the user to ask for help.
+ *
+ * @module gui/js/"help.window"
+ */
+
 const WindowManager = require('./window_manager')
 const HELP_SCREEN_WIDTH = 768
 const HELP_SCREEN_HEIGHT = 570

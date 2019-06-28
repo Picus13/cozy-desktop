@@ -1,4 +1,7 @@
-/* @flow */
+/**
+ * @module core/local/atom/channel
+ * @flow
+ */
 
 const Promise = require('bluebird')
 

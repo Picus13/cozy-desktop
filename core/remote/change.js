@@ -1,4 +1,8 @@
-/* @flow */
+/** A remote change to be send to Prep/Merge.
+ *
+ * @module core/remote/change
+ * @flow
+ */
 
 /*::
 import type { RemoteDoc, RemoteDeletion } from './document'

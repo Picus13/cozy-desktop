@@ -1,4 +1,7 @@
-/* @flow */
+/** Checksum files one at a time.
+ *
+ * @flow
+ */
 
 const Promise = require('bluebird')
 const async = require('async')

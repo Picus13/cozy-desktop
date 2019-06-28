@@ -1,3 +1,8 @@
+/** The systray popover window.
+ *
+ * @module gui/js/"tray.window"
+ */
+
 const electron = require('electron')
 const { dialog, shell } = electron
 const { spawn } = require('child_process')

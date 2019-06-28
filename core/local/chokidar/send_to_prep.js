@@ -1,4 +1,8 @@
-/* @flow */
+/** Send LocalChanges to Prep/Merge
+ *
+ * @module core/local/chokidar/send_to_prep
+ * @flow
+ */
 
 const metadata = require('../../metadata')
 const logger = require('../../utils/logger')

@@ -1,4 +1,8 @@
-/* @flow */
+/** The remote side read/write interface.
+ *
+ * @module core/remote
+ * @flow
+ */
 
 const autoBind = require('auto-bind')
 const Promise = require('bluebird')

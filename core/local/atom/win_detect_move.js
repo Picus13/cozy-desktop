@@ -1,4 +1,11 @@
-/* @flow */
+/** This step aggregates deleted & added events into renamed ones on Windows.
+ *
+ * On windows, ReadDirectoryChangesW emits a deleted and an added events when
+ * a file or directory is moved. This step merges the two events to a single
+ * renamed event.
+ *
+ * @flow
+ */
 
 const _ = require('lodash')
 const path = require('path')
@@ -174,9 +181,6 @@ function sendReadyBatches(
   }
 }
 
-// On windows, ReadDirectoryChangesW emits a deleted and an added events when
-// a file or directory is moved. This step merges the two events to a single
-// renamed event.
 async function winDetectMove(
   channel,
   output,

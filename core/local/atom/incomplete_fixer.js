@@ -1,4 +1,17 @@
-/* @flow */
+/** Try to fix incomplete events from previous steps.
+ *
+ * When a file is added or updated, and it is moved just after, the first
+ * event is marked as incomplete by addChecksum because we cannot compute the
+ * checksum at the given path. But the event is still relevant, in particular
+ * if a directory that is an ancestor of this file has been moved. With the
+ * renamed event, by comparing the path, we can extrapolate the new path and
+ * check with fs.stats if we have a file here.
+ *
+ * Cf test/property/local_watcher/swedish_krona.json
+ *
+ * @module core/local/atom/incomplete_fixer
+ * @flow
+ */
 
 const path = require('path')
 
@@ -145,14 +158,6 @@ function buildDeletedFromRenamed(
   }
 }
 
-// When a file is added or updated, and it is moved just after, the first event
-// is marked as incomplete by addChecksum because we cannot compute the
-// checksum at the given path. But the event is still relevant, in particular if
-// a directory that is an ancestor of this file has been moved. With the renamed
-// event, by comparing the path, we can extrapolate the new path and check with
-// fs.stats if we have a file here.
-//
-// Cf test/property/local_watcher/swedish_krona.json
 function loop(
   channel /*: Channel */,
   opts /*: IncompleteFixerOptions */

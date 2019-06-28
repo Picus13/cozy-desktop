@@ -1,4 +1,7 @@
-/* @flow */
+/**
+ * @module core/local/chokidar/event_buffer
+ * @flow
+ */
 
 const autoBind = require('auto-bind')
 

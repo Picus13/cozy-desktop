@@ -1,3 +1,8 @@
+/** The app automatic updates window.
+ *
+ * @module gui/js/"updated.window"
+ */
+
 const Promise = require('bluebird')
 const WindowManager = require('./window_manager')
 const { autoUpdater } = require('electron-updater')

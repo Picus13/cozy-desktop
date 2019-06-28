@@ -1,4 +1,10 @@
-/* @flow */
+/** A local change as to be fed to Prep/Merge.
+ *
+ * Ended up being specific to ChokidarWatcher.
+ *
+ * @module core/local/chokidar/local_change
+ * @flow
+ */
 
 const _ = require('lodash')
 const path = require('path')

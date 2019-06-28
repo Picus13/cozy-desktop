@@ -1,4 +1,7 @@
-/* @flow */
+/**
+ * @module core/remote/cozy
+ * @flow
+ */
 
 const autoBind = require('auto-bind')
 const CozyClient = require('cozy-client-js').Client

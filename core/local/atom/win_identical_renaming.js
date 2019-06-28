@@ -1,4 +1,13 @@
-/* @flow */
+/** This step handles identical renaming on Windows.
+ *
+ * An identical renaming is a renaming where the source and destination would
+ * both have the same identity on the current filesystem:
+ *
+ * - Names differing only by their case: `foo` vs `Foo` vs `FOO`
+ * - Names equivalent from a Unicode point of view
+ *
+ * @flow
+ */
 
 const _ = require('lodash')
 

@@ -1,3 +1,7 @@
+/**
+ * @module core/utils/fs
+ */
+
 const Promise = require('bluebird')
 const childProcess = require('child_process')
 

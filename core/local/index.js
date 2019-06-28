@@ -1,4 +1,8 @@
-/* @flow */
+/** The Local side read/write interface.
+ *
+ * @module core/local
+ * @flow
+ */
 
 const async = require('async')
 const autoBind = require('auto-bind')

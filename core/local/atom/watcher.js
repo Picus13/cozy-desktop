@@ -1,4 +1,7 @@
-/* @flow */
+/**
+ * @module core/local/atom/watcher
+ * @flow
+ */
 
 const Promise = require('bluebird')
 const _ = require('lodash')

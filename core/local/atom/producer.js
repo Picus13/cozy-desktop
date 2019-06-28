@@ -1,4 +1,7 @@
-/* @flow */
+/**
+ * @module core/local/atom/producer
+ * @flow
+ */
 
 const autoBind = require('auto-bind')
 const fse = require('fs-extra') // Used for await

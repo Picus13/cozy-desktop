@@ -1,4 +1,11 @@
-/* @flow */
+/** This step is a port of awaitWriteFinish (aWF) from chokidar.
+ *
+ * It debounces write events for files, as we can have several of them in a
+ * short lapse of time, and computing the checksum several times in a row for
+ * the same file is not a good idea.
+ *
+ * @flow
+ */
 
 const _ = require('lodash')
 
@@ -201,10 +208,6 @@ function debounce(waiting /*: WaitingItem[] */, events /*: AtomEvent[] */) {
   }
 }
 
-// This is a port of awaitWriteFinish (aWF) from chokidar. It debounces write
-// events for files, as we can have several of them in a short lapse of time,
-// and computing the checksum several times in a row for the same file is not a
-// good idea.
 async function awaitWriteFinish(channel /*: Channel */, out /*: Channel */) {
   const waiting /*: WaitingItem[] */ = []
 

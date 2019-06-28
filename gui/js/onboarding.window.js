@@ -1,3 +1,8 @@
+/** The onboarding window, showing on first use or when unlinked from the Cozy.
+ *
+ * @module gui/js/"onboarding.window"
+ */
+
 const { addFileManagerShortcut } = require('./shortcut')
 const { dialog, session } = require('electron')
 const autoLaunch = require('./autolaunch')

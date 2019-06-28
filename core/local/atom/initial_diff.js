@@ -1,4 +1,13 @@
-/* @flow */
+/** This step handle the events of the AtomWatcher initial scan.
+ *
+ * Some files and directories can have been deleted while cozy-desktop was
+ * stopped. So, at the end of the initial scan, we have to do a diff between
+ * what was in pouchdb and the events from the local watcher to find what was
+ * deleted.
+ *
+ * @module core/local/atom/initial_diff
+ * @flow
+ */
 
 const _ = require('lodash')
 const path = require('path')
@@ -52,10 +61,6 @@ module.exports = {
   clearState
 }
 
-// Some files and directories can have been deleted while cozy-desktop was
-// stopped. So, at the end of the initial scan, we have to do a diff between
-// what was in pouchdb and the events from the local watcher to find what was
-// deleted.
 function loop(
   channel /*: Channel */,
   opts /*: { pouch: Pouch, state: InitialDiffState } */
