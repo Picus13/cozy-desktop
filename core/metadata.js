@@ -82,6 +82,7 @@ type RemoteRev = string
 export type RemoteRevisionsByID = { [RemoteID] : RemoteRev}
 
 export type MetadataSidesInfo = {
+  rev: number,
   remote?: number,
   local?: number
 }
@@ -370,13 +371,13 @@ function extractRevNumber(doc /*: Metadata|{_rev: string} */) {
 // Return true if the remote file is up-to-date for this document
 function isUpToDate(side /*: SideName */, doc /*: Metadata */) {
   let currentRev = doc.sides[side] || 0
-  let lastRev = extractRevNumber(doc)
+  let lastRev = doc.sides.rev
   return currentRev === lastRev
 }
 
 function isAtLeastUpToDate(side /*: SideName */, doc /*: Metadata */) {
   let currentRev = doc.sides[side] || 0
-  let lastRev = extractRevNumber(doc)
+  let lastRev = doc.sides.rev
   return currentRev >= lastRev
 }
 
@@ -391,7 +392,7 @@ function markAsNew(doc /*: Metadata */) {
 }
 
 function markAsUpToDate(doc /*: Metadata */) {
-  let rev = extractRevNumber(doc) + 1
+  let rev = ++doc.sides.rev
   for (let s of ['local', 'remote']) {
     doc.sides[s] = rev
   }
@@ -405,7 +406,7 @@ function upToDate(doc /*: Metadata */) /*: Metadata */ {
 
   return _.assign(clone, {
     errors: undefined,
-    sides: { local: rev, remote: rev }
+    sides: { rev, local: rev, remote: rev }
   })
 }
 
@@ -541,23 +542,27 @@ function markSide(
   doc /*: Metadata */,
   prev /*: ?Metadata */
 ) /*: Metadata */ {
-  let rev = 0
-  if (prev) {
-    rev = extractRevNumber(prev)
-  }
+  const prevSides = prev && prev.sides
+  let prevRev = rev(prevSides)
+
   if (doc.sides == null) {
-    const was = prev && prev.sides
-    doc.sides = clone(was || {})
+    doc.sides = clone(prevSides || { rev: prevRev })
   }
-  doc.sides[side] = ++rev
+  doc.sides[side] = prevRev + 1
+  doc.sides.rev = prevRev + 1
   return doc
 }
 
 function incSides(doc /*: {sides?: MetadataSidesInfo} */) /*: void */ {
   doc.sides = {
+    rev: rev(doc.sides) + 1,
     local: side(doc, 'local') + 1,
     remote: side(doc, 'remote') + 1
   }
+}
+
+function rev(sides /*: ?MetadataSidesInfo */) /*: number */ {
+  return (sides && sides.rev) || 0
 }
 
 function side(
