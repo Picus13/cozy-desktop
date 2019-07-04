@@ -212,7 +212,7 @@ module.exports.init = async (
         updated_at: lastModifiedDate,
         path: localPath,
         tags: [],
-        sides: { local: 1, remote: 1 }
+        sides: { rev: 1, local: 1, remote: 1 }
       }
       stater.assignInoAndFileId(doc, stats)
 
@@ -267,7 +267,7 @@ module.exports.init = async (
         path: localPath,
         size: content.length,
         tags: [],
-        sides: { local: 1, remote: 1 }
+        sides: { rev: 1, local: 1, remote: 1 }
       }
       stater.assignInoAndFileId(doc, stats)
       if (!isOutside) {
