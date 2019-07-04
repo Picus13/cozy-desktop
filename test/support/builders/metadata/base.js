@@ -173,7 +173,9 @@ module.exports = class BaseMetadataBuilder {
   }
 
   upToDate() /*: this */ {
-    this.doc.sides = { rev: 2, local: 2, remote: 2 }
+    const sides = this.doc.sides || { rev: 1 }
+    const newRev = sides.rev + 1
+    this.doc.sides = { rev: newRev, local: newRev, remote: newRev }
     return this
   }
 
