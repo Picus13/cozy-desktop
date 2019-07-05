@@ -48,6 +48,10 @@ const detectOfflineUnlinkEvents = async (
   let unappliedMoves = []
 
   for (const doc of docs) {
+    if (metadata.needsRevMigration(doc)) {
+      await metadata.migrateRev(doc, { pouch })
+    }
+
     if (inInitialScan(doc) || doc.trashed || doc.incompatibilities) {
       emptySyncDir = false
     } else if (doc.moveFrom) {

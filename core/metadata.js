@@ -54,6 +54,7 @@ import type { PathIssue } from './path_restrictions'
 import type { RemoteDoc } from './remote/document'
 import type { Stats } from './local/stater'
 import type { Ignore } from './ignore'
+import type Pouch from './pouch'
 */
 
 const log = logger({
@@ -167,7 +168,9 @@ module.exports = {
   outOfDateSide,
   createConflictingDoc,
   CONFLICT_REGEXP,
-  shouldIgnore
+  shouldIgnore,
+  needsRevMigration,
+  migrateRev
 }
 
 function localDocType(remoteDocType /*: string */) /*: string */ {
@@ -674,4 +677,22 @@ function shouldIgnore(
     relativePath: doc._id,
     isFolder: doc.docType === 'folder'
   })
+}
+
+function needsRevMigration(existing /*: Metadata */) /*: boolean %checks */ {
+  return existing.sides == null || existing.sides.rev == null
+}
+
+async function migrateRev(
+  existing /*: Metadata */,
+  { pouch } /*: { pouch: Pouch } */
+) /*: Promise<Metadata> */ {
+  log.info({ path: existing.path, _rev: existing._rev }, 'Migrating _rev')
+  const doc = _.defaultsDeep(
+    { sides: { rev: extractRevNumber(existing) } },
+    existing
+  )
+  const { rev: _rev } = await pouch.put(doc)
+  doc._rev = _rev
+  return doc
 }

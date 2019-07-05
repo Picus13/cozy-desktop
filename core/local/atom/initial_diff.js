@@ -12,7 +12,7 @@
 const _ = require('lodash')
 const path = require('path')
 
-const { id } = require('../../metadata')
+const metadata = require('../../metadata')
 const Channel = require('./channel')
 const logger = require('../../utils/logger')
 
@@ -89,6 +89,10 @@ async function initialState(
   const byInode /*: Map<number|string, Metadata> */ = new Map()
   const docs /*: Metadata[] */ = await opts.pouch.byRecursivePathAsync('')
   for (const doc of docs) {
+    if (metadata.needsRevMigration(doc)) {
+      await metadata.migrateRev(doc, opts)
+    }
+
     if (doc.ino != null) {
       // Process only files/dirs that were created locally or synchronized
       byInode.set(doc.fileid || doc.ino, doc)
@@ -166,7 +170,7 @@ async function initialDiff(
             batch.push({
               action: 'deleted',
               kind: kind(was),
-              _id: id(was.path),
+              _id: metadata.id(was.path),
               [STEP_NAME]: { inodeReuse: event },
               path: was.path
             })
@@ -202,7 +206,7 @@ async function initialDiff(
           const deletedEvent /*: AtomEvent */ = {
             action: 'deleted',
             kind: kind(doc),
-            _id: id(doc.path),
+            _id: metadata.id(doc.path),
             path: doc.path
           }
           fixPathsAfterParentMove(renamedEvents, deletedEvent)
@@ -305,7 +309,7 @@ function fixPathsAfterParentMove(renamedEvents, event) {
       )
       if (event.oldPath !== pathFixed) {
         event.path = pathFixed
-        event._id = id(event.path)
+        event._id = metadata.id(event.path)
       }
       _.set(
         event,
