@@ -313,15 +313,16 @@ describe('Merge', function() {
           })
 
           it('migrates the existing file', async function() {
-            const expectedRevNumber =
-              metadata.extractRevNumber(existingFile) + 1
-
             await this.merge.addFileAsync('local', _.cloneDeep(sameFile))
 
             const savedFile = await this.pouch.db.get(existingFile._id)
             should(savedFile).have.properties({
               fileid: sameFile.fileid,
-              sides: { local: expectedRevNumber, remote: expectedRevNumber }
+              sides: {
+                rev: existingFile.sides.rev + 1,
+                local: existingFile.sides.local + 1,
+                remote: existingFile.sides.remote + 1
+              }
             })
           })
         })
@@ -1045,7 +1046,7 @@ describe('Merge', function() {
               sides: increasedSides(was.sides, this.side, 1),
               moveFrom: movedSrc
             },
-            doc
+            _.omit(doc, ['fileid'])
           )
         ],
         resolvedConflicts: []
@@ -1223,14 +1224,13 @@ describe('Merge', function() {
         .create()
       await this.merge.moveFileAsync(
         'local',
-        _.cloneDeep({
-          ...orig,
-          _id: metadata.id('SRC/FILE2'),
-          path: 'SRC/FILE2'
-        }),
+        builders
+          .metafile(orig)
+          .path('SRC/FILE2')
+          .build(),
         _.cloneDeep(orig)
       )
-      const was = await this.pouch.db.get('SRC/FILE2')
+      const was = await this.pouch.db.get(metadata.id('SRC/FILE2'))
       const dst = builders
         .metadir(src)
         .path('DST')
@@ -1306,7 +1306,7 @@ describe('Merge', function() {
         _.cloneDeep(dst),
         _.cloneDeep(src)
       )
-      const was = await this.pouch.db.get('DST/FILE')
+      const was = await this.pouch.db.get(metadata.id('DST/FILE'))
       const doc = await builders
         .metafile(was)
         .path('DST/FILE2')
@@ -1340,8 +1340,6 @@ describe('Merge', function() {
 
     onPlatforms(['win32', 'darwin'], () => {
       it('does not identify an identical renaming as a conflict', async function() {
-        const expectedRevNumber = 5 // up to date + delete + create + update side
-
         const banana = await builders
           .metafile()
           .path('banana')
@@ -1366,18 +1364,17 @@ describe('Merge', function() {
           savedDocs: [
             _.defaults(
               {
-                sides: { [this.side]: expectedRevNumber },
+                sides: increasedSides(banana.sides, this.side, 1),
                 path: BANANA.path,
                 moveFrom: _.defaults(
                   {
-                    sides: { [this.side]: 2, [otherSide(this.side)]: 2 },
                     moveTo: BANANA._id,
                     _deleted: true
                   },
                   banana
                 )
               },
-              _.omit(banana, ['_rev']) // TODO: Compare _revs
+              _.omit(banana, ['_rev'])
             )
           ],
           resolvedConflicts: []
@@ -1554,7 +1551,7 @@ describe('Merge', function() {
               moveFrom: movedSrc
             },
             _.pick(was, ['ino']),
-            _.omit(doc, ['_rev'])
+            _.omit(doc, ['_rev', 'fileid'])
           )
         ],
         resolvedConflicts: []
@@ -1730,8 +1727,6 @@ describe('Merge', function() {
 
     onPlatforms(['win32', 'darwin'], () => {
       it('does not identify an identical renaming as a conflict', async function() {
-        const expectedRevNumber = 5 // up to date + delete + create + update side
-
         const apple = await builders
           .metadir()
           .path('apple')
@@ -1756,10 +1751,9 @@ describe('Merge', function() {
           savedDocs: [
             _.defaults(
               {
-                sides: { [this.side]: expectedRevNumber },
+                sides: increasedSides(apple.sides, this.side, 1),
                 moveFrom: _.defaults(
                   {
-                    sides: { [this.side]: 2, [otherSide(this.side)]: 2 },
                     moveTo: APPLE._id,
                     _deleted: true
                   },
@@ -1767,7 +1761,6 @@ describe('Merge', function() {
                 )
               },
               APPLE
-              // TODO: Compare _revs
             )
           ],
           resolvedConflicts: []
