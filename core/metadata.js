@@ -155,6 +155,7 @@ module.exports = {
   sameFile,
   sameFileIgnoreRev,
   sameBinary,
+  side,
   markSide,
   incSides,
   wasSynced,
@@ -551,17 +552,14 @@ function markSide(
   return doc
 }
 
-function incSides(doc /*: {sides?: MetadataSidesInfo} */) /*: void */ {
+function incSides(doc /*: Metadata */) /*: void */ {
   doc.sides = {
     local: side(doc, 'local') + 1,
     remote: side(doc, 'remote') + 1
   }
 }
 
-function side(
-  doc /*: {sides?: MetadataSidesInfo} */,
-  sideName /*: SideName */
-) /*: number */ {
+function side(doc /*: Metadata */, sideName /*: SideName */) /*: number */ {
   return (doc.sides || {})[sideName] || 0
 }
 
