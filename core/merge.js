@@ -486,14 +486,10 @@ class Merge {
       let dst = clone(doc)
       dst._id = makeDestinationID(doc)
       dst.path = doc.path.replace(was.path, folder.path)
-      if (src.sides && src.sides[side] && !src.sides[otherSide(side)]) {
-        metadata.markAsUnsyncable(side, src)
-        metadata.markAsNew(dst)
-        metadata.markSide(side, dst)
-      } else if (src.sides && !src.sides[side] && src.sides[otherSide(side)]) {
-        metadata.markAsUnsyncable(otherSide(side), src)
-        metadata.markAsNew(dst)
-        metadata.markSide(otherSide(side), dst)
+
+      const singleSide = detectSingleSide(src)
+      if (singleSide) {
+        convertToDestinationAddition(singleSide, dst, src)
       } else {
         move.child(side, src, dst)
       }
@@ -796,6 +792,24 @@ const needsFileidMigration = (
   existing /*: Metadata */,
   fileid /*: ?string */
 ) /*: boolean %checks */ => existing.fileid == null && fileid != null
+
+const sideNames = new Set(['local', 'remote'])
+
+const detectSingleSide = doc => {
+  if (doc.sides) {
+    for (const sideName of sideNames) {
+      if (doc.sides[sideName] && !doc.sides[otherSide(sideName)]) {
+        return sideName
+      }
+    }
+  }
+}
+
+const convertToDestinationAddition = (side, dst, src) => {
+  metadata.markAsUnsyncable(side, src)
+  metadata.markAsNew(dst)
+  metadata.markSide(side, dst)
+}
 
 module.exports = {
   Merge,
