@@ -1704,7 +1704,7 @@ describe('Merge', function() {
           _.omit(movedSrc, ['_rev']), // TODO: Compare _revs
           _.defaults(
             {
-              sides: { [this.side]: 1 },
+              sides: { [this.side]: existing.sides[this.side] + 1 },
               moveFrom: movedSrc,
               overwrite: existing
             },

@@ -40,8 +40,8 @@ function move(side /*: SideName */, src /*: Metadata */, dst /*: Metadata */) {
   if (!dst.overwrite) {
     delete dst._rev
   }
-  delete dst.sides
-  metadata.markSide(side, dst)
+  reinitializeSides(dst, src)
+  metadata.markSide(side, dst, dst)
 }
 
 // Same as move() but mark the source as a child move so it will be moved with
@@ -49,4 +49,16 @@ function move(side /*: SideName */, src /*: Metadata */, dst /*: Metadata */) {
 function child(side /*: SideName */, src /*: Metadata */, dst /*: Metadata */) {
   src.childMove = true
   move(side, src, dst)
+}
+
+function reinitializeSides(dst /*: Metadata */, src /*: Metadata */) {
+  const shortRev = metadata.extractRevNumber(src)
+  const newLocal = metadata.side(src, 'local') - shortRev
+  const newRemote = metadata.side(src, 'remote') - shortRev
+
+  const sides = {}
+  if (newLocal > 0) sides.local = newLocal
+  if (newRemote > 0) sides.remote = newRemote
+
+  dst.sides = sides
 }
