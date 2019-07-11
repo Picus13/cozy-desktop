@@ -487,9 +487,9 @@ class Merge {
       dst._id = makeDestinationID(doc)
       dst.path = doc.path.replace(was.path, folder.path)
 
-      const singleSide = detectSingleSide(src)
+      const singleSide = metadata.detectSingleSide(src)
       if (singleSide) {
-        convertToDestinationAddition(singleSide, dst, src)
+        move.convertToDestinationAddition(singleSide, src, dst)
       } else {
         move.child(side, src, dst)
       }
@@ -792,24 +792,6 @@ const needsFileidMigration = (
   existing /*: Metadata */,
   fileid /*: ?string */
 ) /*: boolean %checks */ => existing.fileid == null && fileid != null
-
-const sideNames = new Set(['local', 'remote'])
-
-const detectSingleSide = doc => {
-  if (doc.sides) {
-    for (const sideName of sideNames) {
-      if (doc.sides[sideName] && !doc.sides[otherSide(sideName)]) {
-        return sideName
-      }
-    }
-  }
-}
-
-const convertToDestinationAddition = (side, dst, src) => {
-  metadata.markAsUnsyncable(side, src)
-  metadata.markAsNew(dst)
-  metadata.markSide(side, dst)
-}
 
 module.exports = {
   Merge,

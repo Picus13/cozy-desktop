@@ -39,15 +39,17 @@ const mime = require('mime')
 const deepDiff = require('deep-diff').diff
 const path = require('path')
 
+const logger = require('./utils/logger')
+const timestamp = require('./utils/timestamp')
+const fsutils = require('./utils/fs')
+
 const {
   detectPathIssues,
   detectPathLengthIssue
 } = require('./path_restrictions')
 const { DIR_TYPE, FILE_TYPE } = require('./remote/constants')
-const logger = require('./utils/logger')
-const timestamp = require('./utils/timestamp')
+const { SIDE_NAMES, otherSide } = require('./side')
 
-const fsutils = require('./utils/fs')
 /*::
 import type fs from 'fs'
 import type { PathIssue } from './path_restrictions'
@@ -156,6 +158,7 @@ module.exports = {
   sameFileIgnoreRev,
   sameBinary,
   side,
+  detectSingleSide,
   markSide,
   incSides,
   wasSynced,
@@ -561,6 +564,16 @@ function incSides(doc /*: Metadata */) /*: void */ {
 
 function side(doc /*: Metadata */, sideName /*: SideName */) /*: number */ {
   return (doc.sides || {})[sideName] || 0
+}
+
+function detectSingleSide(doc /*: Metadata */) /*: ?SideName */ {
+  if (doc.sides) {
+    for (const sideName of SIDE_NAMES) {
+      if (doc.sides[sideName] && !doc.sides[otherSide(sideName)]) {
+        return sideName
+      }
+    }
+  }
 }
 
 function wasSynced(doc /*: Metadata */) /*: boolean */ {
