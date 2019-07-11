@@ -183,10 +183,10 @@
   resolved "https://registry.yarnpkg.com/@types/node/-/node-11.13.8.tgz#e5d71173c95533be9842b2c798978f095f912aab"
   integrity sha512-szA3x/3miL90ZJxUCzx9haNbK5/zmPieGraZEe4WI+3srN0eGLiT22NXeMHmyhNEopn+IrxqMc7wdVwvPl8meg==
 
-"@types/node@^8.0.24":
-  version "8.9.5"
-  resolved "https://registry.yarnpkg.com/@types/node/-/node-8.9.5.tgz#162b864bc70be077e6db212b322754917929e976"
-  integrity sha512-jRHfWsvyMtXdbhnz5CVHxaBgnV6duZnPlQuRSo/dm/GnmikNcmZhxIES4E9OZjUmQ8C+HCl4KJux+cXN/ErGDQ==
+"@types/node@^10.12.18":
+  version "10.14.12"
+  resolved "https://registry.yarnpkg.com/@types/node/-/node-10.14.12.tgz#0eec3155a46e6c4db1f27c3e588a205f767d622f"
+  integrity sha512-QcAKpaO6nhHLlxWBvpc4WeLrTvPqlHOvaj0s5GriKkA1zq+bsFBPpfYCvQhLqLgYlIko8A9YrPdaMHCo5mBcpg==
 
 "@types/prop-types@*":
   version "15.7.1"
@@ -2059,12 +2059,12 @@ electron-window@^0.8.0:
   dependencies:
     is-electron-renderer "^2.0.0"
 
-electron@^3.1.11:
-  version "3.1.11"
-  resolved "https://registry.yarnpkg.com/electron/-/electron-3.1.11.tgz#3381d8a3c5c58809c226530f9b773d0baf1bef45"
-  integrity sha512-ejLO4Ac/jkvcP2SoMJ9CRmbaSBPOdp9fDngGsXI6rK318ndq8gmHJK+g8YXWGvKm6Wj9rCqhsLCG46gUWUWlZw==
+electron@^4.2.6:
+  version "4.2.6"
+  resolved "https://registry.yarnpkg.com/electron/-/electron-4.2.6.tgz#533763a7970136011fd36e4a5f2b3715b2015994"
+  integrity sha512-qnaQXQcRKugXoQ7/4J4lYKzyU/RJMK/qrIGyC8KsgGG/IVVagolNPYy7QrsGpJ7YwpQHzNjwtDNaJ/UI7VTCyA==
   dependencies:
-    "@types/node" "^8.0.24"
+    "@types/node" "^10.12.18"
     electron-download "^4.1.0"
     extract-zip "^1.0.3"
 
