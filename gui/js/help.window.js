@@ -10,6 +10,7 @@ module.exports = class TrayWM extends WindowManager {
   windowOptions() {
     return {
       title: 'HELP',
+      autoHideMenuBar: true,
       width: HELP_SCREEN_WIDTH,
       height: HELP_SCREEN_HEIGHT
     }

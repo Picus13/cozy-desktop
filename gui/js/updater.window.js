@@ -30,6 +30,7 @@ module.exports = class UpdaterWM extends WindowManager {
   windowOptions() {
     return {
       title: 'UPDATER',
+      autoHideMenuBar: true,
       width: 500,
       height: 400
     }
